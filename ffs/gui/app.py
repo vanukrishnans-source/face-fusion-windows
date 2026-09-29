@@ -243,9 +243,39 @@ class MainWindow(QMainWindow):
         i = eng.info
         if i.active == "DirectML":
             self.chip.setText("GPU · DirectML"); self.chip.setProperty("state", "")
+        elif i.fell_back or i.fallback_reason:
+            self.chip.setText("CPU · GPU failed"); self.chip.setProperty("state", "cpu")
+            self.chip.setToolTip(i.fallback_reason or "DirectML unavailable — using CPU")
         else:
             self.chip.setText("CPU"); self.chip.setProperty("state", "cpu")
         self.chip.style().unpolish(self.chip); self.chip.style().polish(self.chip)
+
+    def _toast_gpu_fallback(self, reason=""):
+        self.set_chip()
+        # Non-blocking-ish: show after the current event finishes so we never raise on the ORT thread
+        def _show():
+            try:
+                QMessageBox.information(
+                    self, "Using CPU",
+                    "GPU (DirectML) failed, so this PC is using CPU instead.\n\n"
+                    "Everything still works — just slower.\n\n"
+                    + (reason[:300] if reason else "")
+                    + "\n\nOptions → Retry GPU to try again, or leave Processor on CPU.")
+            except Exception:  # noqa: BLE001
+                pass
+        QTimer.singleShot(0, _show)
+
+    def _ensure_engine_hooks(self):
+        eng = self.job.engine
+        if eng is None:
+            return
+        if getattr(eng, "_gui_hooked", False):
+            return
+        eng._gui_hooked = True
+        eng.on_fallback(lambda reason: QTimer.singleShot(0, lambda: self._toast_gpu_fallback(reason)))
+        if eng.info.fell_back and not getattr(self, "_fallback_toasted", False):
+            self._fallback_toasted = True
+            QTimer.singleShot(200, lambda: self._toast_gpu_fallback(eng.info.fallback_reason))
 
     def _about(self):
         QMessageBox.information(
@@ -501,6 +531,7 @@ class MainWindow(QMainWindow):
         self.worker = Worker(work, self)
 
         def done(res):
+            self._ensure_engine_hooks()
             frame, faces = res
             self.thumb = frame; self.vfaces = faces; self._redraw()
 
@@ -667,9 +698,12 @@ class MainWindow(QMainWindow):
         if self.bench_done or self._busy_worker(): return
         self.chip.setText("Measuring speed…")
         def work(cancelled, emit):
+            eng = self.job.get_engine(); 
             return self.job.benchmark()
         self.bw = Worker(work, self)
-        self.bw.done.connect(self._bench_done)
+        def _bench_ok(b):
+            self._ensure_engine_hooks(); self._bench_done(b)
+        self.bw.done.connect(_bench_ok)
         self.bw.failed.connect(lambda m, t: (self.set_chip(), self.chip.setToolTip(m)))
         self.bw.start()
 
@@ -767,6 +801,20 @@ class MainWindow(QMainWindow):
     def _change_out(self):
         d = QFileDialog.getExistingDirectory(self, "Output folder", self.opt["out_dir"])
         if d: self._set_opt("out_dir", d); self.out_label.setText(d)
+
+    def _retry_gpu(self):
+        from .. import dml_probe
+        dml_probe.clear_status()
+        os.environ.pop("FFS_FORCE_DML_FAIL", None)
+        os.environ["FFS_DML_REPROBE"] = "1"
+        self._fallback_toasted = False
+        if self.job.engine:
+            self.job.engine.close(); self.job.engine = None
+        self.job.device = "auto"; self.cfg.setValue("device", "auto")
+        self.seg_dev.set("auto")
+        self.bench_done = False
+        self.chip.setText("Retrying GPU…")
+        QTimer.singleShot(100, self._start_bench)
 
     def _refresh_options(self):
         lines = []

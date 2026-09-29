@@ -1,4 +1,12 @@
-"""ONNX Runtime engine: DirectML (Radeon 780M) with automatic CPU fallback."""
+"""ONNX Runtime engine: DirectML (Radeon 780M) with automatic CPU fallback.
+
+Critical safety rule: a native fault inside onnxruntime-directml aborts the *entire*
+process (the Ally X window just vanishes). Python try/except cannot catch that.
+We therefore:
+  1. Probe DirectML in a short-lived child process before any in-process DML use.
+  2. Wrap every in-process DML session create / run in try/except and fall back to CPU.
+  3. Persist a "DML bad" marker so the next launch skips GPU until the user retries.
+"""
 from __future__ import annotations
 
 import logging
@@ -13,6 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from . import models as M
+from . import dml_probe
 
 log = logging.getLogger("ffs")
 
@@ -33,6 +42,12 @@ WARMUP = {
     "gpen_bfr_256": {"input": (1, 3, 256, 256)},
     "gpen_bfr_512": {"input": (1, 3, 512, 512)},
     "gfpgan_1.4": {"input": (1, 3, 512, 512)},
+}
+
+# Safer DML EP options for AMD Radeon 780M / Windows iGPU
+DML_PROVIDER_OPTIONS = {
+    "device_id": 0,
+    "disable_metacommands": "1",
 }
 
 
@@ -98,11 +113,14 @@ class DeviceInfo:
     adapter: str = ""
     fallback_reason: str = ""
     per_model: dict = field(default_factory=dict)
+    fell_back: bool = False  # True when we wanted GPU but are on CPU
 
     def label(self):
         if self.active == "DirectML":
             return f"GPU · DirectML{(' · ' + self.adapter) if self.adapter else ''}"
-        return "CPU" + (f" (GPU unavailable: {self.fallback_reason})" if self.fallback_reason else "")
+        if self.fell_back or self.fallback_reason:
+            return "CPU (GPU failed — using CPU)" + (f": {self.fallback_reason[:80]}" if self.fallback_reason else "")
+        return "CPU"
 
 
 def gpu_adapter_name() -> str:
@@ -120,11 +138,10 @@ def gpu_adapter_name() -> str:
 
 
 class Engine:
-    """ONNX sessions are created and run on one dedicated thread.
+    """ONNX sessions are created and run on one dedicated MTA thread.
 
-    DirectML is COM-based and aborts the process (the window just vanishes) when `Session.run` happens
-    on a different thread from the one that created the session, or concurrently from the detect/swap
-    pools. Qt's UI thread is STA; DirectML wants MTA. All inference is hopped onto `_loop`.
+    DirectML is never used in-process until an out-of-process probe succeeds.
+    Any later DML Python exception flips the engine to CPU for the rest of the life.
     """
 
     def __init__(self, store: M.ModelStore, device: str = "auto", threads: int = 0):
@@ -138,6 +155,7 @@ class Engine:
         self._emap = None
         self._stuck = False
         self._stuck_why = ""
+        self._fallback_listeners = []
         try:
             self.infer_timeout = float(os.environ.get("FFS_INFER_TIMEOUT", "120") or 120)
         except ValueError:
@@ -146,21 +164,63 @@ class Engine:
         self.info = DeviceInfo(requested=device)
         avail = ort.get_available_providers()
         self.dml_available = "DmlExecutionProvider" in avail
+
+        want_dml = device in ("auto", "dml") and self.dml_available
         if device in ("auto", "dml") and not self.dml_available:
             self.info.fallback_reason = "DirectML not in this onnxruntime build"
-        self.info.active = "DirectML" if (device in ("auto", "dml") and self.dml_available) else "CPU"
+            self.info.fell_back = device != "cpu"
+            want_dml = False
+
+        if want_dml:
+            disabled, why = dml_probe.dml_disabled_by_status()
+            if disabled:
+                log.warning("DirectML skipped: %s", why)
+                self.info.fallback_reason = why
+                self.info.fell_back = True
+                want_dml = False
+            else:
+                # Out-of-process probe with the smallest required model we have
+                probe_model = None
+                for spec in (M.YOLOFACE, M.ARCFACE, M.SWAPPER):
+                    if store.is_installed(spec):
+                        probe_model = str(store.path(spec)); break
+                if probe_model is None:
+                    self.info.fallback_reason = "no model available to probe DirectML"
+                    self.info.fell_back = True
+                    want_dml = False
+                else:
+                    ok, reason = dml_probe.probe_directml(probe_model)
+                    if not ok:
+                        log.warning("DirectML probe failed — using CPU: %s", reason)
+                        self.info.fallback_reason = reason or "DirectML probe failed"
+                        self.info.fell_back = True
+                        want_dml = False
+
+        self.info.active = "DirectML" if want_dml else "CPU"
         if self.info.active == "DirectML":
             self.info.adapter = gpu_adapter_name()
         self._q: queue.Queue = queue.Queue()
         self._thr = threading.Thread(target=self._loop, name="ffs-ort", daemon=True)
         self._thr.start()
 
+    def on_fallback(self, cb):
+        """Register callback(reason: str) invoked once when we fall back mid-run."""
+        self._fallback_listeners.append(cb)
+
+    def _notify_fallback(self, reason: str):
+        self.info.fell_back = True
+        self.info.fallback_reason = reason
+        for cb in list(self._fallback_listeners):
+            try:
+                cb(reason)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _loop(self):
         if os.name == "nt":
             try:
                 import ctypes
-                # COINIT_MULTITHREADED — DirectML must not run on Qt's STA UI thread.
-                ctypes.windll.ole32.CoInitializeEx(None, 0x0)
+                ctypes.windll.ole32.CoInitializeEx(None, 0x0)  # COINIT_MULTITHREADED
             except Exception as e:  # noqa: BLE001
                 log.warning("CoInitializeEx MTA failed: %s", e)
         while True:
@@ -170,7 +230,7 @@ class Engine:
             fn, box, ev = item
             try:
                 box["result"] = fn()
-            except BaseException as e:  # noqa: BLE001 — handed back to the caller
+            except BaseException as e:  # noqa: BLE001
                 box["error"] = e
             finally:
                 ev.set()
@@ -178,7 +238,7 @@ class Engine:
     def _stuck_message(self):
         why = self._stuck_why or "the GPU did not respond"
         return (f"Face processing stalled ({why}). This job was stopped so the app would not sit forever. "
-                "Restart Face Fusion Studio and, in Options, set Processor to CPU if it keeps happening. "
+                "Set Processor to CPU in Options if it keeps happening. "
                 "Details: %LOCALAPPDATA%\\FaceFusionStudio\\crash.log")
 
     def _call(self, fn, timeout):
@@ -193,6 +253,10 @@ class Engine:
             self._stuck = True
             self._stuck_why = f"no result in {timeout:.0f}s on {self.info.active}"
             log.error("inference timeout: %s", self._stuck_why)
+            # Treat GPU hang as DML failure so next launch skips it
+            if self.info.active == "DirectML":
+                dml_probe.write_status(False, self._stuck_why)
+                self._demote_to_cpu(self._stuck_why)
             raise RuntimeError(self._stuck_message())
         if "error" in box:
             err = box["error"]
@@ -204,18 +268,47 @@ class Engine:
     def _options(self, dml: bool):
         so = self.ort.SessionOptions()
         so.log_severity_level = 3
+        so.graph_optimization_level = self.ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
         if dml:
             so.enable_mem_pattern = False
+            so.enable_cpu_mem_arena = False
             so.execution_mode = self.ort.ExecutionMode.ORT_SEQUENTIAL
+            try:
+                so.inter_op_num_threads = 1
+                so.intra_op_num_threads = 1
+            except Exception:  # noqa: BLE001
+                pass
         else:
             so.enable_cpu_mem_arena = False
             if self.threads:
                 so.intra_op_num_threads = self.threads; so.inter_op_num_threads = 1
         return so
 
+    def _demote_to_cpu(self, reason: str):
+        """Abandon DirectML for this process; drop any DML sessions."""
+        if self.info.active != "DirectML" and not self.info.fell_back:
+            self.info.fallback_reason = reason
+            self.info.fell_back = True
+            return
+        log.warning("Demoting DirectML → CPU: %s", reason)
+        self.info.active = "CPU"
+        self.info.fell_back = True
+        self.info.fallback_reason = reason
+        # Drop sessions that may be bound to DML
+        doomed = [n for n, tag in self.info.per_model.items() if tag == "DirectML"]
+        for n in doomed:
+            self.sessions.pop(n, None)
+            self.info.per_model.pop(n, None)
+        dml_probe.write_status(False, reason)
+        self._notify_fallback(reason)
+
+    def _open_cpu(self, path, name):
+        s = self.ort.InferenceSession(path, self._options(False), providers=["CPUExecutionProvider"])
+        self.info.per_model[name] = "CPU"
+        return s
+
     def _open(self, name):
         spec = FILES[name]
-        # GFPGAN: accept size-matched file even if placeholder SHA differs
         if name == "gfpgan_1.4":
             p = self.store.path(spec)
             if not p.is_file() or p.stat().st_size != spec.bytes:
@@ -223,25 +316,26 @@ class Engine:
         elif not self.store.is_installed(spec):
             raise FileNotFoundError(f"model not downloaded: {spec.file}")
         path = str(self.store.path(spec))
+
         if self.info.active == "DirectML":
             try:
-                s = self.ort.InferenceSession(path, self._options(True),
-                                              providers=[("DmlExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"])
+                s = self.ort.InferenceSession(
+                    path, self._options(True),
+                    providers=[("DmlExecutionProvider", dict(DML_PROVIDER_OPTIONS)), "CPUExecutionProvider"],
+                )
                 used = s.get_providers()
                 if not used or used[0] != "DmlExecutionProvider":
                     raise RuntimeError(f"DirectML provider not used (got {used})")
                 self._warm(s, name)
                 self.info.per_model[name] = "DirectML"
                 return s
-            except Exception as e:  # noqa: BLE001
-                if self.device == "dml":
-                    raise
-                log.warning("DirectML failed for %s: %s -> CPU", name, e)
-                self.info.fallback_reason = f"{type(e).__name__}: {str(e)[:160]}"
-                self.info.active = "CPU"
-        s = self.ort.InferenceSession(path, self._options(False), providers=["CPUExecutionProvider"])
-        self.info.per_model[name] = "CPU"
-        return s
+            except Exception as e:  # noqa: BLE001 — never kill the app over DML
+                reason = f"{name}: {type(e).__name__}: {str(e)[:160]}"
+                log.warning("DirectML session create failed — CPU fallback: %s", reason)
+                self._demote_to_cpu(reason)
+                # fall through to CPU
+
+        return self._open_cpu(path, name)
 
     def _warm(self, s, name):
         shape = WARMUP.get(name)
@@ -250,13 +344,10 @@ class Engine:
         feeds = {k: np.zeros(v, np.float32) for k, v in shape.items()}
         if name == "inswapper_128_fp16":
             feeds["source"][:] = 0.04
-        try:
-            s.run(None, feeds)
-        except Exception:  # noqa: BLE001 — warmup best-effort (input name may differ)
-            pass
+        # Warmup failure is a DML signal — raise so _open falls back
+        s.run(None, feeds)
 
     def _session_locked(self, name):
-        """Create/fetch a session. Only call on the ORT thread."""
         s = self.sessions.get(name)
         if s is None:
             s = self._open(name)
@@ -264,7 +355,6 @@ class Engine:
         return s
 
     def session(self, name):
-        # Model load + DirectML graph compile can take a couple of minutes the first time.
         return self._call(lambda: self._session_locked(name), timeout=max(300.0, self.infer_timeout))
 
     def prepare(self, enhance_mode=None, detector="yolo"):
@@ -273,7 +363,15 @@ class Engine:
         if enhance_mode:
             names.append({"gpen256": "gpen_bfr_256", "gpen512": "gpen_bfr_512", "gfpgan": "gfpgan_1.4"}[enhance_mode])
         for n in names:
-            self.session(n)
+            try:
+                self.session(n)
+            except Exception as e:  # noqa: BLE001
+                # Last resort: if somehow still on DML and prepare blows up, demote and retry once
+                if self.info.active == "DirectML":
+                    self._demote_to_cpu(f"prepare {n}: {type(e).__name__}: {e}")
+                    self.session(n)
+                else:
+                    raise
         return self.info
 
     def run(self, name, feeds):
@@ -290,9 +388,15 @@ class Engine:
             try:
                 s = self._session_locked(name)
                 return s.run(None, safe)
-            except RuntimeError:
-                raise
             except Exception as e:  # noqa: BLE001
+                if self.info.active == "DirectML" or self.info.per_model.get(name) == "DirectML":
+                    reason = f"run {name}: {type(e).__name__}: {str(e)[:160]}"
+                    log.warning("DirectML run failed — retry on CPU: %s", reason)
+                    self._demote_to_cpu(reason)
+                    # Force CPU session for this model
+                    self.sessions.pop(name, None)
+                    s = self._session_locked(name)
+                    return s.run(None, safe)
                 log.exception("onnx run %s failed", name)
                 raise RuntimeError(f"{name} failed on {self.info.active}: {type(e).__name__}: {e}") from e
 

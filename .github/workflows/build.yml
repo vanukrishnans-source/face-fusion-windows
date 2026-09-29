@@ -90,6 +90,19 @@ jobs:
           Get-Content "$out\selftest_report.json"
           if ($code -ne 0) { throw "selftest failed: $code" }
 
+      - name: DirectML failure → CPU fallback (process must stay alive)
+        shell: pwsh
+        run: |
+          $out = "$PWD\selftest-out\dml-fallback"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $env:FFS_FORCE_DML_FAIL = "1"
+          & dist\FaceFusionStudio\FaceFusionStudio_cli.exe --test-dml-fallback `
+            --models "$PWD\.models-cache" --out $out
+          $code = $LASTEXITCODE
+          Remove-Item Env:FFS_FORCE_DML_FAIL -ErrorAction SilentlyContinue
+          Get-Content "$out\dml_fallback_report.json"
+          if ($code -ne 0) { throw "dml fallback test failed: $code" }
+
       - name: Selftest - packaged windowed FaceFusionStudio.exe (sample with audio)
         shell: pwsh
         run: |
@@ -198,6 +211,7 @@ jobs:
             "",
             "### Fixes in this release",
             "- Finding faces no longer hangs then closes the app (DirectML/ONNX on one dedicated MTA thread; detect off UI thread).",
+            "- GPU crash on Ally X / Radeon 780M: child-process DirectML probe; any failure → CPU + toast (app stays open).",
             "- Photo swap works end-to-end (Swap enables in Photo mode; Done page handles photo results).",
             "- Final / Finalize always completes or times out with a clear error; progress + Cancel.",
             "- Ally X UI: Photo|Video toggle, numbered steps, large face-map thumbs, Segoe UI fonts.",

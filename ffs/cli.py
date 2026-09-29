@@ -194,6 +194,9 @@ def selftest(args):
         report["sample_frames"] = dict(before_after=str(out_dir / "before_after_mid.jpg"), W=res["W"], H=res["H"])
         if args.dml_smoke:
             report["directml"] = dml_smoke(store, i_, d, asg, photo)
+            # Simulated DML failure must keep the process alive on CPU
+            report["dml_fallback_sim"] = _sim_dml_fallback(store)
+            c["dml_fallback_sim_ok"] = bool(report["dml_fallback_sim"].get("ok"))
         report["ok"] = all(bool(x) for k, x in c.items() if k != "photo_faces") and c["photo_faces"] >= 1
     except Exception as e:  # noqa: BLE001
         report["error"] = f"{type(e).__name__}: {e}"
@@ -203,6 +206,34 @@ def selftest(args):
     rep_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     log.info("report %s ok=%s checks=%s", rep_path, report["ok"], report["checks"])
     return 0 if report["ok"] else 1
+
+
+def _sim_dml_fallback(store):
+    """In-process simulation used by --selftest --dml-smoke."""
+    from . import dml_probe
+    from .engine import Engine
+    out = {"ok": False}
+    prev = os.environ.get("FFS_FORCE_DML_FAIL")
+    try:
+        os.environ["FFS_FORCE_DML_FAIL"] = "1"
+        dml_probe.clear_status()
+        eng = Engine(store, "auto")
+        info = eng.prepare(None)
+        out.update(active=info.active, fell_back=info.fell_back, reason=info.fallback_reason,
+                   label=info.label())
+        out["ok"] = info.active == "CPU" and bool(info.fell_back or info.fallback_reason)
+        eng.close()
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {e}"
+        out["ok"] = False
+    finally:
+        if prev is None:
+            os.environ.pop("FFS_FORCE_DML_FAIL", None)
+        else:
+            os.environ["FFS_FORCE_DML_FAIL"] = prev
+        dml_probe.clear_status()  # don't poison later GPU tries on the runner
+    log.info("dml fallback sim %s", json.dumps(out, default=str))
+    return out
 
 
 def dml_smoke(store, frame, dets, assign, photo):
@@ -289,6 +320,54 @@ def bench(args):
     return 0
 
 
+
+def test_dml_fallback(args):
+    """Simulate DirectML failure; assert Engine falls back to CPU and process stays alive."""
+    from . import dml_probe, models as M
+    from .engine import Engine
+    report = {"ok": False, "checks": {}}
+    try:
+        os.environ["FFS_FORCE_DML_FAIL"] = "1"
+        dml_probe.clear_status()
+        store = _models(args.models, list(M.REQUIRED)[:1] or list(M.REQUIRED), args.model_cache)
+        # Even with device=dml / auto, must land on CPU without aborting
+        eng = Engine(store, "auto")
+        info = eng.prepare(None)
+        report["device"] = info.label()
+        report["active"] = info.active
+        report["fell_back"] = info.fell_back
+        report["fallback_reason"] = info.fallback_reason
+        report["checks"]["stayed_alive"] = True
+        report["checks"]["active_is_cpu"] = info.active == "CPU"
+        report["checks"]["marked_fell_back"] = bool(info.fell_back or info.fallback_reason)
+        # Run one real inference on CPU path
+        import numpy as np
+        from . import detect
+        detect.set_default_engine(eng)
+        img = np.zeros((128, 128, 3), np.uint8)
+        img[:] = (40, 60, 80)
+        hits = detect.detect_faces(img, engine=eng)
+        report["checks"]["detect_on_cpu_ok"] = True
+        report["hits"] = len(hits)
+        st = dml_probe.read_status()
+        report["dml_status"] = st
+        report["checks"]["status_file_not_ok"] = st.get("ok") is False
+        report["ok"] = all(report["checks"].values())
+        eng.close()
+    except Exception as e:  # noqa: BLE001
+        report["error"] = f"{type(e).__name__}: {e}"
+        report["traceback"] = traceback.format_exc()
+        log.error("test_dml_fallback failed: %s", report.get("traceback"))
+    finally:
+        os.environ.pop("FFS_FORCE_DML_FAIL", None)
+    out = Path(args.out or ".")
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "dml_fallback_report.json"
+    path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    log.info("dml fallback report %s ok=%s %s", path, report["ok"], report.get("checks"))
+    return 0 if report["ok"] else 1
+
+
 def main(argv=None):
     try:
         code = _main(argv)
@@ -314,6 +393,9 @@ def main(argv=None):
 def _main(argv=None):
     p = argparse.ArgumentParser(prog="FaceFusionStudio")
     p.add_argument("--selftest", action="store_true")
+    p.add_argument("--dml-probe", metavar="MODEL", help="Child-process DirectML smoke (exit 0=ok)")
+    p.add_argument("--test-dml-fallback", action="store_true",
+                   help="Simulate DML failure and assert CPU fallback keeps process alive")
     p.add_argument("--run", nargs=3, metavar=("VIDEO", "PHOTO", "OUT"))
     p.add_argument("--run-photo", nargs=3, metavar=("TARGET", "SOURCE", "OUT"))
     p.add_argument("--bench", action="store_true")
@@ -339,8 +421,13 @@ def _main(argv=None):
     p.add_argument("--no-emb-track", action="store_false", dest="emb_track")
     p.set_defaults(color_match=True, emb_track=True, same_gender=True)
     args, _ = p.parse_known_args(argv)
-    headless = args.selftest or args.run or args.run_photo or args.bench
+    if getattr(args, "dml_probe", None):
+        from . import dml_probe
+        return dml_probe.run_probe_in_this_process(args.dml_probe)
+    headless = args.selftest or args.run or args.run_photo or args.bench or getattr(args, "test_dml_fallback", False)
     _setup_logging(verbose=bool(headless) and not args.quiet)
+    if getattr(args, "test_dml_fallback", False):
+        return test_dml_fallback(args)
     if args.selftest:
         if not args.video or not args.photo:
             p.error("--selftest needs --video and --photo")
