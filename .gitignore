@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+.models-cache/
+clips/
+selftest-out/
+screens-ci/
+parity/
+refvenv/
+ffmpeg/
