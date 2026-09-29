@@ -111,17 +111,24 @@ def run_probe_in_this_process(model_path: str) -> int:
         so.enable_mem_pattern = False
         so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         # Safer DirectML EP options for Radeon 780M / iGPU
-        dml_opts = {
-            "device_id": 0,
-            "disable_metacommands": "1",  # more compatible path
-        }
-        sess = ort.InferenceSession(
-            str(path), so,
-            providers=[("DmlExecutionProvider", dml_opts), "CPUExecutionProvider"],
-        )
-        used = sess.get_providers()
-        if not used or used[0] != "DmlExecutionProvider":
-            print(f"DML_PROBE fail: not using DML ({used})", flush=True)
+        last = None
+        sess = None
+        for dml_opts in ({"device_id": 0}, {"device_id": 0, "disable_metacommands": True}):
+            try:
+                sess = ort.InferenceSession(
+                    str(path), so,
+                    providers=[("DmlExecutionProvider", dml_opts), "CPUExecutionProvider"],
+                )
+                used = sess.get_providers()
+                if used and used[0] == "DmlExecutionProvider":
+                    break
+                last = f"not using DML ({used}) with {dml_opts}"
+                sess = None
+            except Exception as e:  # noqa: BLE001
+                last = f"{type(e).__name__}: {e}"
+                sess = None
+        if sess is None:
+            print(f"DML_PROBE fail: {last}", flush=True)
             return 2
         # Tiny warmup — first InferenceSession.run is where many 780M crashes hit
         inp = sess.get_inputs()[0]

@@ -44,11 +44,12 @@ WARMUP = {
     "gfpgan_1.4": {"input": (1, 3, 512, 512)},
 }
 
-# Safer DML EP options for AMD Radeon 780M / Windows iGPU
-DML_PROVIDER_OPTIONS = {
-    "device_id": 0,
-    "disable_metacommands": "1",
-}
+# Safer DML EP option sets for AMD Radeon 780M / Windows iGPU.
+# ORT expects real bool/int (string "1" makes the EP refuse to load).
+DML_PROVIDER_TRIES = [
+    {"device_id": 0},
+    {"device_id": 0, "disable_metacommands": True},
+]
 
 
 def _varint(b, i):
@@ -318,22 +319,26 @@ class Engine:
         path = str(self.store.path(spec))
 
         if self.info.active == "DirectML":
-            try:
-                s = self.ort.InferenceSession(
-                    path, self._options(True),
-                    providers=[("DmlExecutionProvider", dict(DML_PROVIDER_OPTIONS)), "CPUExecutionProvider"],
-                )
-                used = s.get_providers()
-                if not used or used[0] != "DmlExecutionProvider":
-                    raise RuntimeError(f"DirectML provider not used (got {used})")
-                self._warm(s, name)
-                self.info.per_model[name] = "DirectML"
-                return s
-            except Exception as e:  # noqa: BLE001 — never kill the app over DML
-                reason = f"{name}: {type(e).__name__}: {str(e)[:160]}"
-                log.warning("DirectML session create failed — CPU fallback: %s", reason)
-                self._demote_to_cpu(reason)
-                # fall through to CPU
+            last_err = None
+            for opts in DML_PROVIDER_TRIES:
+                try:
+                    s = self.ort.InferenceSession(
+                        path, self._options(True),
+                        providers=[("DmlExecutionProvider", dict(opts)), "CPUExecutionProvider"],
+                    )
+                    used = s.get_providers()
+                    if not used or used[0] != "DmlExecutionProvider":
+                        raise RuntimeError(f"DirectML provider not used (got {used})")
+                    self._warm(s, name)
+                    self.info.per_model[name] = "DirectML"
+                    return s
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    log.warning("DirectML try %s failed for %s: %s", opts, name, e)
+            reason = f"{name}: {type(last_err).__name__}: {str(last_err)[:160]}"
+            log.warning("DirectML session create failed — CPU fallback: %s", reason)
+            self._demote_to_cpu(reason)
+            # fall through to CPU
 
         return self._open_cpu(path, name)
 
