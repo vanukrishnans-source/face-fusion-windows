@@ -64,9 +64,13 @@ def force_fail_env() -> bool:
 def dml_disabled_by_status() -> tuple[bool, str]:
     """Return (disabled, reason) if a previous probe said DML is unsafe."""
     if force_fail_env():
-        return True, "FFS_FORCE_DML_FAIL=1 (simulated GPU failure)"
+        reason = "FFS_FORCE_DML_FAIL=1 (simulated GPU failure)"
+        write_status(False, reason)
+        return True, reason
     if os.environ.get("FFS_FORCE_CPU", "").strip() in ("1", "true", "yes"):
-        return True, "FFS_FORCE_CPU=1"
+        reason = "FFS_FORCE_CPU=1"
+        write_status(False, reason)
+        return True, reason
     st = read_status()
     if st.get("ok") is False:
         return True, st.get("reason") or "previous DirectML probe failed"

@@ -6,7 +6,7 @@ Touch-friendly **Windows x64** face-swap app for the **ASUS ROG Ally X** (Window
 
 | | This app |
 |---|---|
-| Package | Face Fusion Studio **1.1.1** (portable zip) |
+| Package | Face Fusion Studio **1.1.2** (portable zip) |
 | Acceleration | **ONNX Runtime DirectML** on the Radeon 780M, automatic CPU fallback |
 | Modes | **Photo swap** + **Video swap** |
 | Default resolution | ≤ **1080p** short side (never upscales) |
@@ -20,7 +20,7 @@ Touch-friendly **Windows x64** face-swap app for the **ASUS ROG Ally X** (Window
 
 ## Download
 
-### What’s new in 1.1.1
+### What’s new in 1.1.2
 - **Fix:** app no longer exits while “Finding faces” (DirectML was being called from the wrong thread / apartment).
 - **Fix:** “Final / Finalize” (encode + audio mux) always finishes or fails with a clear timeout — no more hanging on FFmpeg.
 - Real progress text during Final; Cancel still works; crashes write `%LOCALAPPDATA%\FaceFusionStudio\crash.log`.
@@ -41,7 +41,7 @@ The build is **not code-signed**. Windows SmartScreen will say “Windows protec
 Verify the zip:
 
 ```powershell
-Get-FileHash .\FaceFusionStudio-1.1.1-win64.zip -Algorithm SHA256
+Get-FileHash .\FaceFusionStudio-1.1.2-win64.zip -Algorithm SHA256
 ```
 
 ### Install / run

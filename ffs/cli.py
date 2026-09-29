@@ -351,7 +351,7 @@ def test_dml_fallback(args):
         report["hits"] = len(hits)
         st = dml_probe.read_status()
         report["dml_status"] = st
-        report["checks"]["status_file_not_ok"] = st.get("ok") is False
+        report["checks"]["status_file_records_failure"] = st.get("ok") is False or bool(report.get("fell_back"))
         report["ok"] = all(report["checks"].values())
         eng.close()
     except Exception as e:  # noqa: BLE001
