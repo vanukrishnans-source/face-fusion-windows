@@ -53,7 +53,10 @@ def take_screenshots(args) -> int:
     win.go(PAGE_MAIN); shot(win, "03_main_empty")
     if not (args.video and args.photo):
         return 0
-    win.set_video(args.video); win.set_photo(args.photo)
+    win.set_video(args.video)
+    spin(until=lambda: not win.worker or not win.worker.isRunning(), timeout=600)
+    win.set_photo(args.photo)
+    spin(until=lambda: win.photo is not None and (not win.worker or not win.worker.isRunning()), timeout=600)
     if args.length: win.s_len.setValue(int(args.length * 10))
     win.go(PAGE_MAIN); shot(win, "04_main_faces_pairing")
     win.go(PAGE_OPTIONS); shot(win, "05_options")

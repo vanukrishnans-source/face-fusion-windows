@@ -457,24 +457,53 @@ class Job:
         h, w = tgt.shape[:2]
         W, H, s = vcore.out_size(w, h, st.max_short, st.align)
         frame = vcore.prep(tgt, W, H, s) if s < 1 or (W, H) != (w, h) else tgt
-        if progress: progress(dict(stage="detect", done=0, total=1))
+        if cancel and cancel(): raise Cancelled()
+        if progress: progress(dict(stage="detect", done=0, total=1, detail="Finding faces in the photo…"))
         hits = detect.detect_frame_hits(frame, max(len(source_photo.faces), 2), st.detect_opts(), engine=eng)
         dets = [h.kps for h in hits]
         if st.same_gender and source_photo.genders:
             try:
                 from . import gender as G
                 G.annotate_hits(frame, hits)
+                # Prefer same-gender pairing when labels exist
+                try:
+                    tg = [h.gender for h in hits]
+                    if any(tg) and any(source_photo.genders):
+                        assign_g = []
+                        src_by_g = {}
+                        for si, g in enumerate(source_photo.genders):
+                            src_by_g.setdefault(g or "?", []).append(si)
+                        used = set()
+                        for i, g in enumerate(tg):
+                            pool = [s for s in src_by_g.get(g or "?", []) if s not in used] or [
+                                s for s in range(len(source_photo.faces)) if s not in used]
+                            a = pool[0] if pool else -1
+                            if a >= 0: used.add(a)
+                            assign_g.append(a)
+                        if max(assign_g) >= 0:
+                            assign = assign_g
+                        else:
+                            assign = vcore.pair_single_frame(dets, len(source_photo.faces), st.rotation)
+                    else:
+                        assign = vcore.pair_single_frame(dets, len(source_photo.faces), st.rotation)
+                except Exception:  # noqa: BLE001
+                    assign = vcore.pair_single_frame(dets, len(source_photo.faces), st.rotation)
             except Exception:  # noqa: BLE001
-                pass
-        assign = vcore.pair_single_frame(dets, len(source_photo.faces), st.rotation)
+                assign = vcore.pair_single_frame(dets, len(source_photo.faces), st.rotation)
+        else:
+            assign = vcore.pair_single_frame(dets, len(source_photo.faces), st.rotation)
         if not dets or max(assign) < 0:
-            raise ValueError("No face found in the target photo.")
+            raise ValueError("No face found in the target photo. Try a clearer, front-facing picture.")
+        if progress: progress(dict(stage="detect", done=1, total=1, detail=f"Found {len(dets)} face(s)"))
         lat = self._latents(eng, source_photo, assign)
         faces = [(dets[i].astype(np.float32), lat[a]) for i, a in enumerate(assign) if a >= 0]
-        if progress: progress(dict(stage="swap", done=0, total=1))
+        if not faces:
+            raise ValueError("Could not map any faces. Tap Flip and try again, or pick another photo.")
+        if progress: progress(dict(stage="swap", done=0, total=1, detail="Swapping faces…"))
         if cancel and cancel(): raise Cancelled()
         out = core.process_frame(eng, frame, faces, st.enhance,
                                  color_match=st.color_match, seamless=st.seamless)
+        if progress: progress(dict(stage="mux", done=0, total=1, detail="Saving photo…"))
         out_dir = Path(st.out_dir) if st.out_dir else default_pictures_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         if out_path is None:
@@ -485,9 +514,13 @@ class Job:
         ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         if not ok:
             raise RuntimeError("JPEG encode failed")
-        buf.tofile(str(out_path))
-        if progress: progress(dict(stage="done", done=1, total=1))
+        # Atomic write — avoid a half file if the process is killed mid-save
+        tmp = out_path.with_suffix(".jpg.tmp")
+        buf.tofile(str(tmp))
+        os.replace(tmp, out_path)
+        if progress: progress(dict(stage="done", done=1, total=1, detail="Done"))
         return dict(path=str(out_path), W=out.shape[1], H=out.shape[0], mode="photo",
+                    fps=0.0, duration=0.0, frames=1, encoder="jpeg", audio="photo (no sound)",
                     device=dev.label(), device_active=dev.active, enhance=ENHANCE_LABEL.get(st.enhance),
                     faces=len(faces), total_s=round(time.perf_counter() - t0, 2), size=out_path.stat().st_size,
                     before=frame, after=out, dets=dets, assign=assign)
@@ -509,16 +542,19 @@ def default_pictures_dir() -> Path:
     return Path.home() / "Pictures" / "FaceFusion"
 
 
-    @staticmethod
-    def _dump(d, info, an, assign, pf, photo, st):
-        """Same layout as reference video_pipeline --dump (for the parity comparison)."""
-        sel = [int(round(t * info.fps)) for t in an.times]
-        json.dump({"W": an.W, "H": an.H, "fps": an.fps, "src_fps": info.fps, "sel": sel, "assign": assign,
-                   "pairing_frame": pf, "n_src": len(photo.faces), "rotation": st.rotation}, open(f"{d}/meta.json", "w"))
-        np.save(f"{d}/fb.npy", np.stack([np.asarray(f, np.float32) for f in photo.faces]))
-        np.save(f"{d}/src_rgb.npy", photo.img[:, :, ::-1].copy())
-        with open(f"{d}/dets.json", "w") as fh:
-            json.dump([[x[:, :2].astype(float).round(6).tolist() for x in ds] for ds in an.dets], fh)
-        with open(f"{d}/tracks.json", "w") as fh:
-            json.dump({"raw": [{str(f): p.round(6).tolist() for f, p in t.items()} for t in an.tracks],
-                       "smooth": [{str(f): p.round(6).tolist() for f, p in t.items()} for t in an.smooth]}, fh)
+# Attach dump helper onto Job (kept at module level for clarity after photo helpers).
+def _job_dump(self, d, info, an, assign, pf, photo, st):
+    """Same layout as reference video_pipeline --dump (for the parity comparison)."""
+    sel = [int(round(t * info.fps)) for t in an.times]
+    json.dump({"W": an.W, "H": an.H, "fps": an.fps, "src_fps": info.fps, "sel": sel, "assign": assign,
+               "pairing_frame": pf, "n_src": len(photo.faces), "rotation": st.rotation}, open(f"{d}/meta.json", "w"))
+    np.save(f"{d}/fb.npy", np.stack([np.asarray(f, np.float32) for f in photo.faces]))
+    np.save(f"{d}/src_rgb.npy", photo.img[:, :, ::-1].copy())
+    with open(f"{d}/dets.json", "w") as fh:
+        json.dump([[x[:, :2].astype(float).round(6).tolist() for x in ds] for ds in an.dets], fh)
+    with open(f"{d}/tracks.json", "w") as fh:
+        json.dump({"raw": [{str(f): p.round(6).tolist() for f, p in t.items()} for t in an.tracks],
+                   "smooth": [{str(f): p.round(6).tolist() for f, p in t.items()} for t in an.smooth]}, fh)
+
+
+Job._dump = _job_dump

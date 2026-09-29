@@ -1,7 +1,12 @@
-"""Face Fusion Studio — Qt (PySide6) GUI for Windows, touch-first for the ROG Ally X (7" 1080p, 150 % scaling).
+"""Face Fusion Studio — touch-first Qt UI for the ROG Ally X (7" 1080p @ 150%).
 
-Pages: Setup (model download) · Main (video + faces photo, detected faces, pairing + Flip, trim) ·
-Preview (before / after) · Options · Progress · Done.  All heavy work runs in QThreads.
+Wizard flow (big steps, large buttons):
+  1 · Choose Photo or Video and pick the target
+  2 · Pick the photo with the faces to use
+  3 · Map faces (big thumbnails + Flip)
+  4 · Swap
+
+Heavy work always runs in QThreads. DirectML inference is serialised in Engine.
 """
 from __future__ import annotations
 
@@ -12,20 +17,25 @@ import time
 import traceback
 from pathlib import Path
 
-log = logging.getLogger("ffs")
-
 import cv2
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QIcon, QImage, QKeyEvent, QPixmap
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-                               QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
-                               QSlider, QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QImage, QKeyEvent, QPixmap
+from PySide6.QtWidgets import (
+    QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+    QSlider, QStackedWidget, QVBoxLayout, QWidget,
+)
 
 from .. import __version__, detect, media, vcore
-from ..job import (ENHANCE_LABEL, ENHANCE_SPECS, MAX_CLIP_S, Cancelled, Job, Settings, default_out_dir, default_pictures_dir, load_photo)
-from ..models import ARCFACE, ENHANCER_HQ, ENHANCER_LIGHT, SWAPPER, YOLOFACE, RETINAFACE, ModelStore, REQUIRED_BYTES
+from ..job import (
+    ENHANCE_LABEL, ENHANCE_SPECS, MAX_CLIP_S, Cancelled, Job, Settings,
+    default_out_dir, default_pictures_dir, load_photo,
+)
+from ..models import ENHANCER_LIGHT, ENHANCER_HQ, ModelStore, REQUIRED_BYTES
 from .theme import DARK_QSS
+
+log = logging.getLogger("ffs")
 
 TEAL = (169, 184, 0)      # BGR of #00b8a9
 ORANGE = (61, 138, 255)
@@ -35,7 +45,6 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 
 def pix(bgr, w, h):
-    """BGR ndarray -> QPixmap fitted into w x h (logical px; rendered at device pixel ratio)."""
     if bgr is None or getattr(bgr, "size", 0) == 0:
         return QPixmap()
     dpr = QApplication.instance().devicePixelRatio() if QApplication.instance() else 1.0
@@ -44,9 +53,11 @@ def pix(bgr, w, h):
     if ih < 1 or iw < 1:
         return QPixmap()
     s = min(W / iw, H / ih)
-    img = cv2.resize(bgr, (max(1, int(iw * s)), max(1, int(ih * s))), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+    img = cv2.resize(bgr, (max(1, int(iw * s)), max(1, int(ih * s))),
+                     interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    p = QPixmap.fromImage(QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format.Format_RGB888).copy())
+    p = QPixmap.fromImage(QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0],
+                                 QImage.Format.Format_RGB888).copy())
     p.setDevicePixelRatio(dpr)
     return p
 
@@ -57,16 +68,18 @@ def draw_faces(img, faces, labels, colors=None):
         x0, y0, x1, y1 = [int(v) for v in vcore.bbox(f)]
         c = (colors[i] if colors else TEAL)
         cv2.rectangle(out, (x0, y0), (x1, y1), c, th)
-        fs = max(0.6, img.shape[1] / 1400)
+        fs = max(0.7, img.shape[1] / 1400)
         (tw, tht), _ = cv2.getTextSize(labels[i], cv2.FONT_HERSHEY_SIMPLEX, fs, th)
         cv2.rectangle(out, (x0, max(0, y0 - tht - 12)), (x0 + tw + 10, y0), c, -1)
         cv2.putText(out, labels[i], (x0 + 5, y0 - 6), cv2.FONT_HERSHEY_SIMPLEX, fs, (20, 16, 4), th, cv2.LINE_AA)
     return out
 
 
-def face_crop(img, f, size=96):
+def face_crop(img, f, size=120):
     x0, y0, x1, y1 = vcore.bbox(f); cx, cy = (x0 + x1) / 2, (y0 + y1) / 2; r = max(x1 - x0, y1 - y0) * 0.7
     a, b = int(max(0, cx - r)), int(max(0, cy - r)); c, d = int(min(img.shape[1], cx + r)), int(min(img.shape[0], cy + r))
+    if d <= b or c <= a:
+        return np.zeros((size, size, 3), np.uint8)
     return cv2.resize(img[b:d, a:c], (size, size), interpolation=cv2.INTER_AREA)
 
 
@@ -102,6 +115,7 @@ def button(text, kind=None, min_w=0):
     if kind: b.setObjectName(kind)
     if min_w: b.setMinimumWidth(min_w)
     b.setCursor(Qt.CursorShape.PointingHandCursor)
+    b.setMinimumHeight(56)
     return b
 
 
@@ -112,8 +126,8 @@ def label(text="", kind=None, wrap=False):
     return l
 
 
-def card():
-    f = QFrame(); f.setObjectName("card"); return f
+def card(oid="card"):
+    f = QFrame(); f.setObjectName(oid); return f
 
 
 def image_label(h):
@@ -123,7 +137,6 @@ def image_label(h):
 
 
 class Segmented(QWidget):
-    """Row of large checkable buttons (touch-friendly radio group)."""
     changed = Signal(object)
 
     def __init__(self, items):
@@ -134,44 +147,47 @@ class Segmented(QWidget):
             b = button(text); b.setObjectName("seg"); b.setCheckable(True); b.setMinimumHeight(56)
             self.group.addButton(b); lay.addWidget(b, 1); self.buttons[value] = b
             b.clicked.connect(lambda _=False, v=value: self.changed.emit(v))
+        if items:
+            self.buttons[items[0][1]].setChecked(True)
 
     def set(self, value):
-        if value in self.buttons: self.buttons[value].setChecked(True)
+        b = self.buttons.get(value)
+        if b: b.setChecked(True)
 
     def value(self):
         for v, b in self.buttons.items():
             if b.isChecked(): return v
+        return None
 
 
 class ImageSlot(QFrame):
-    """Drop target + tap-to-open card with a thumbnail."""
     clicked = Signal()
     dropped = Signal(str)
 
-    def __init__(self, title, empty_text, w=560, h=300):
-        super().__init__(); self.setObjectName("card"); self.setAcceptDrops(True); self.w, self.h = w, h
-        lay = QVBoxLayout(self); lay.setContentsMargins(14, 12, 14, 12); lay.setSpacing(6)
-        top = QHBoxLayout(); self.title = label(title, "section"); top.addWidget(self.title); top.addStretch(1)
-        self.open_btn = button("Open…"); self.open_btn.clicked.connect(self.clicked.emit); top.addWidget(self.open_btn)
-        lay.addLayout(top)
-        self.image = QLabel(empty_text); self.image.setObjectName("slot"); self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image.setFixedHeight(h); self.image.setMinimumWidth(200); self.image.setWordWrap(True)
-        self.image.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        lay.addWidget(self.image, 1)
+    def __init__(self, title, hint, w=600, h=240):
+        super().__init__(); self.setObjectName("card"); self.w, self.h = w, h
+        self.setAcceptDrops(True); self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QVBoxLayout(self); lay.setContentsMargins(12, 10, 12, 10); lay.setSpacing(6)
+        self.title = label(title, "section"); lay.addWidget(self.title)
+        self.image = QLabel(hint); self.image.setObjectName("slot")
+        self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image.setMinimumHeight(h); self.image.setWordWrap(True); lay.addWidget(self.image, 1)
         self.info = label("", "hint", True); lay.addWidget(self.info)
 
-    def mouseReleaseEvent(self, e):
+    def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton: self.clicked.emit()
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls(): e.acceptProposedAction()
 
     def dropEvent(self, e):
-        urls = e.mimeData().urls()
-        if urls: self.dropped.emit(urls[0].toLocalFile())
+        for u in e.mimeData().urls(): self.dropped.emit(u.toLocalFile())
 
     def set_image(self, bgr):
         self.image.setPixmap(pix(bgr, self.image.width() or self.w, self.h))
+
+    def clear_image(self, hint="Tap to choose"):
+        self.image.clear(); self.image.setText(hint)
 
 
 class MainWindow(QMainWindow):
@@ -183,20 +199,25 @@ class MainWindow(QMainWindow):
         dev = str(self.cfg.value("device", device)); dev = dev if dev in ("auto", "dml", "cpu") else "auto"
         self.job = Job(store, device if device != "auto" else dev)
         self.info = None; self.photo = None; self.thumb = None; self.vfaces = []
-        self.rotation = 0; self.mode = "video"; self.target_photo = None; self.worker = None; self.result = None; self.bench_done = False
+        self.rotation = 0; self.mode = "video"; self.target_photo = None
+        self.worker = None; self.result = None; self.bench_done = False
+        self._busy = False
         enh = self.cfg.value("enhance", "auto")
         enh = None if enh in (None, "off", "None", "") else (enh if enh in ("auto", "gpen256", "gpen512") else "auto")
-        self.opt = dict(max_short=int(self.cfg.value("max_short", 1080)), fps=float(self.cfg.value("fps", 30.0)),
-                        enhance=enh, out_dir=str(self.cfg.value("out_dir", str(default_out_dir()))),
-                        min_confidence=float(self.cfg.value("min_confidence", 0.62)),
-                        same_gender=self.cfg.value("same_gender", "true") not in (False, "false", "0", 0),
-                        color_match=self.cfg.value("color_match", "true") not in (False, "false", "0", 0),
-                        temporal_smooth=float(self.cfg.value("temporal_smooth", 0.18)),
-                        seamless=self.cfg.value("seamless", "false") in (True, "true", "1", 1))
+        self.opt = dict(
+            max_short=int(self.cfg.value("max_short", 1080)), fps=float(self.cfg.value("fps", 30.0)),
+            enhance=enh, out_dir=str(self.cfg.value("out_dir", str(default_out_dir()))),
+            min_confidence=float(self.cfg.value("min_confidence", 0.62)),
+            same_gender=self.cfg.value("same_gender", "true") not in (False, "false", "0", 0),
+            color_match=self.cfg.value("color_match", "true") not in (False, "false", "0", 0),
+            temporal_smooth=float(self.cfg.value("temporal_smooth", 0.18)),
+            seamless=self.cfg.value("seamless", "false") in (True, "true", "1", 1),
+        )
         root = QWidget(); rl = QVBoxLayout(root); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(0)
         rl.addWidget(self._topbar())
         self.stack = QStackedWidget(); rl.addWidget(self.stack, 1)
-        for build in (self._page_setup, self._page_main, self._page_preview, self._page_options, self._page_progress, self._page_done):
+        for build in (self._page_setup, self._page_main, self._page_preview, self._page_options,
+                      self._page_progress, self._page_done):
             self.stack.addWidget(build())
         self.setCentralWidget(root)
         self.setAcceptDrops(True)
@@ -208,183 +229,168 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ chrome
     def _topbar(self):
-        bar = QFrame(); bar.setObjectName("topbar"); lay = QHBoxLayout(bar); lay.setContentsMargins(16, 8, 12, 8)
+        bar = QFrame(); bar.setObjectName("topbar"); lay = QHBoxLayout(bar); lay.setContentsMargins(16, 10, 12, 10)
         t = label("Face Fusion Studio", "apptitle"); lay.addWidget(t); lay.addSpacing(12)
         self.chip = label("…", "chip"); lay.addWidget(self.chip); lay.addStretch(1)
-        self.btn_opts_top = button("⚙  Options"); self.btn_opts_top.clicked.connect(lambda: self.go(PAGE_OPTIONS)); lay.addWidget(self.btn_opts_top)
-        about = button("About"); about.clicked.connect(self._about); lay.addWidget(about)
+        self.btn_opts_top = button("Options", None, 140); self.btn_opts_top.clicked.connect(lambda: self.go(PAGE_OPTIONS)); lay.addWidget(self.btn_opts_top)
+        about = button("About", None, 120); about.clicked.connect(self._about); lay.addWidget(about)
         return bar
 
     def set_chip(self):
         eng = self.job.engine
         if eng is None:
-            self.chip.setText("Processor: starts with the first job"); return
+            self.chip.setText("Ready"); self.chip.setProperty("state", ""); return
         i = eng.info
         if i.active == "DirectML":
-            self.chip.setText("GPU · DirectML" + (f" · {i.adapter.split(';')[0]}" if i.adapter else "")); self.chip.setProperty("state", "gpu")
+            self.chip.setText("GPU · DirectML"); self.chip.setProperty("state", "")
         else:
-            self.chip.setText("CPU" + (" (GPU unavailable)" if i.fallback_reason and i.requested != "cpu" else "")); self.chip.setProperty("state", "cpu")
-            self.chip.setToolTip(i.fallback_reason)
+            self.chip.setText("CPU"); self.chip.setProperty("state", "cpu")
         self.chip.style().unpolish(self.chip); self.chip.style().polish(self.chip)
+
+    def _about(self):
+        QMessageBox.information(
+            self, "About",
+            f"Face Fusion Studio {__version__}\n\n"
+            "Touch-friendly face swap for Windows / ROG Ally X.\n"
+            "YOLO Face + ArcFace + inswapper + optional GPEN.\n"
+            "Not affiliated with the FaceFusion desktop app.\n\n"
+            f"Crash log: %LOCALAPPDATA%\\FaceFusionStudio\\crash.log")
 
     def go(self, page):
         self.stack.setCurrentIndex(page)
         focus = {PAGE_SETUP: "btn_dl", PAGE_MAIN: "btn_start", PAGE_PROGRESS: "btn_cancel"}.get(page)
-        if focus and getattr(self, focus, None) is not None and getattr(self, focus).isEnabled():
-            getattr(self, focus).setFocus()
+        if focus and hasattr(self, focus): getattr(self, focus).setFocus()
         self.btn_opts_top.setVisible(page in (PAGE_MAIN, PAGE_PREVIEW, PAGE_DONE))
         if page == PAGE_OPTIONS: self._refresh_options()
         if page == PAGE_MAIN: self._update_summary()
 
-    def _about(self):
-        QMessageBox.about(self, "About Face Fusion Studio",
-            f"<b>Face Fusion Studio {__version__}</b> for Windows (x64)<br>Desktop port of the Android app by vanu krishnan.<br><br>"
-            "AI models: InsightFace ArcFace w600k_r50 + inswapper_128 (fp16), genderage, GPEN-BFR-256/512 — downloaded from the "
-            "FaceFusion model releases. <b>InsightFace models are licensed for personal, non-commercial research use only.</b> "
-            "Don't use this app to impersonate or deceive anyone; only swap faces of people who agreed to it.<br><br>"
-            "Uses ONNX Runtime + DirectML (MIT), OpenCV (Apache-2.0), Qt 6 / PySide6 (LGPLv3), "
-            "FFmpeg (LGPL build). See THIRD_PARTY.md next to the app.")
-
     # ------------------------------------------------------------------ setup
     def _page_setup(self):
-        w = QWidget(); outer = QVBoxLayout(w); outer.setContentsMargins(32, 20, 32, 20); outer.setSpacing(12)
-        outer.addWidget(label("One-time setup: download FaceFusion-compatible AI models", "title"))
-        outer.addWidget(label("They are downloaded from the FaceFusion model releases on GitHub (Hugging Face mirror as fallback), "
-                              "checked with SHA-256 and kept in your user folder. Downloads can be paused and resumed.", "subtitle", True))
-        c = card(); g = QGridLayout(c); g.setContentsMargins(16, 12, 16, 12); g.setHorizontalSpacing(16); g.setVerticalSpacing(6)
-        self.setup_rows = {}
-        rows = [(YOLOFACE, "required · FaceFusion detector"), (ARCFACE, "required"), (SWAPPER, "required"), (ENHANCER_LIGHT, "Light enhancer (recommended)"), (ENHANCER_HQ, "HQ enhancer (best on GPU)")]
-        for r, (spec, note) in enumerate(rows):
-            cb = QCheckBox(spec.label); cb.setChecked(True); cb.setEnabled(note != "required")
-            cb.stateChanged.connect(self._refresh_setup)
-            g.addWidget(cb, r, 0); g.addWidget(label(note, "hint"), r, 1)
-            g.addWidget(label(f"{spec.bytes / 1e6:.1f} MB"), r, 2); st = label("", "hint"); g.addWidget(st, r, 3)
-            self.setup_rows[spec.file] = (spec, cb, st)
-        g.setColumnStretch(1, 1)
-        outer.addWidget(c)
-        self.setup_total = label("", "section"); outer.addWidget(self.setup_total)
-        self.setup_bar = QProgressBar(); self.setup_bar.setRange(0, 1000); self.setup_bar.setTextVisible(False); outer.addWidget(self.setup_bar)
-        self.setup_status = label("", "subtitle", True); outer.addWidget(self.setup_status)
+        w = QWidget(); outer = QVBoxLayout(w); outer.setContentsMargins(24, 18, 24, 18); outer.setSpacing(12)
+        outer.addWidget(label("One-time setup", "title"))
+        outer.addWidget(label(
+            "Download the AI models (~465 MB required). They stay on this PC. "
+            "InsightFace models are for personal / non-commercial use only.", "subtitle", True))
+        self.setup_list = label("", "hint", True); outer.addWidget(self.setup_list)
+        self.setup_bar = QProgressBar(); self.setup_bar.setRange(0, 1000); self.setup_bar.setTextVisible(False)
+        self.setup_bar.setMinimumHeight(28); outer.addWidget(self.setup_bar)
+        self.setup_text = label("", "subtitle", True); outer.addWidget(self.setup_text)
+        outer.addStretch(1)
         row = QHBoxLayout()
-        self.btn_dl = button("Download", "primary", 220); self.btn_dl.clicked.connect(self._download); row.addWidget(self.btn_dl)
-        self.btn_pause = button("Pause", None, 140); self.btn_pause.clicked.connect(self._cancel); self.btn_pause.setEnabled(False); row.addWidget(self.btn_pause)
-        imp = button("Import from folder…"); imp.clicked.connect(self._import_models); row.addWidget(imp)
+        self.btn_dl = button("Download models", "primary", 260); self.btn_dl.clicked.connect(self._download); row.addWidget(self.btn_dl)
+        self.btn_cancel_dl = button("Cancel", "danger", 140); self.btn_cancel_dl.clicked.connect(self._cancel); self.btn_cancel_dl.setEnabled(False); row.addWidget(self.btn_cancel_dl)
         row.addStretch(1)
         self.btn_setup_back = button("Back"); self.btn_setup_back.clicked.connect(lambda: self.go(PAGE_OPTIONS)); row.addWidget(self.btn_setup_back)
-        outer.addLayout(row); outer.addStretch(1)
-        outer.addWidget(label("Licence: InsightFace models (ArcFace, inswapper) are for personal / non-commercial use only. "
-                              "GPEN has no published licence (research release).", "hint", True))
+        outer.addLayout(row)
         return w
 
-    def _selected_specs(self):
-        return [spec for spec, cb, _ in self.setup_rows.values() if cb.isChecked() and not self.store.is_installed(spec)]
-
     def _refresh_setup(self):
-        for spec, cb, st in self.setup_rows.values():
-            st.setText("✓ installed" if self.store.is_installed(spec) else "")
-        need = self._selected_specs(); n = sum(s.bytes for s in need)
-        self.setup_total.setText(f"To download: {n / 1e6:.0f} MB" if need else "Everything selected is installed.")
+        miss = self.store.missing_required()
+        self.setup_list.setText(
+            "All required models are installed." if not miss else
+            "Still needed:\n" + "\n".join(f"  · {s.file}  ({s.bytes/1e6:.0f} MB)" for s in miss))
+        self.btn_dl.setEnabled(bool(miss) and not (self.worker and self.worker.isRunning()))
         self.btn_setup_back.setVisible(self.store.all_installed())
-        if not self.worker or not self.worker.isRunning():
-            self.btn_dl.setText("Download" if need else "Continue")
 
     def _download(self):
-        need = self._selected_specs()
-        if not need:
-            self.go(PAGE_MAIN); QTimer.singleShot(100, self._start_bench); return
-        total = sum(s.bytes for s in need)
-        self.btn_dl.setEnabled(False); self.btn_pause.setEnabled(True)
-        self.setup_t0 = time.time()
-
+        if self.worker and self.worker.isRunning(): return
+        self.btn_dl.setEnabled(False); self.btn_cancel_dl.setEnabled(True)
         def work(cancelled, emit):
-            done_before = [0]
-            for spec in need:
-                def prog(file, done, tot, bps, verifying, base=done_before[0]):
-                    emit(dict(done=base + done, total=total, file=file, bps=bps, verifying=verifying))
-                self.store.ensure([spec], progress=prog, cancelled=cancelled)
-                done_before[0] += spec.bytes
+            miss = self.store.missing_required()
+            def prog(f, done, total, bps, verifying):
+                emit(dict(file=f, done=done, total=total, bps=bps, verifying=verifying))
+            self.store.ensure(miss, progress=prog, cancelled=cancelled)
             return True
         self.worker = Worker(work, self)
         self.worker.progressed.connect(self._setup_progress)
-        self.worker.done.connect(lambda _: (self._refresh_setup(), self.btn_dl.setEnabled(True), self.btn_pause.setEnabled(False),
+        self.worker.done.connect(lambda _: (self._refresh_setup(), self.btn_cancel_dl.setEnabled(False),
                                             self.go(PAGE_MAIN), QTimer.singleShot(100, self._start_bench)))
-        self.worker.failed.connect(self._setup_failed)
+        self.worker.failed.connect(self._failed)
         self.worker.start()
 
     def _setup_progress(self, d):
-        self.setup_bar.setValue(int(1000 * d["done"] / max(1, d["total"])))
-        if d["verifying"]:
-            self.setup_status.setText(f"Checking {d['file']} (SHA-256)…")
-        else:
-            eta = (d["total"] - d["done"]) / d["bps"] if d["bps"] > 0 else None
-            self.setup_status.setText(f"Downloading {d['file']} · {d['done'] / 1e6:.0f} of {d['total'] / 1e6:.0f} MB"
-                                      + (f" · {d['bps'] / 1e6:.1f} MB/s · about {media.fmt_time(eta)[:-2]} left" if eta else ""))
+        done, total = d.get("done", 0), max(1, d.get("total", 1))
+        self.setup_bar.setValue(int(1000 * done / total))
+        tag = "Checking" if d.get("verifying") else "Downloading"
+        self.setup_text.setText(f"{tag} {d.get('file','')} · {done/1e6:.0f}/{total/1e6:.0f} MB")
 
-    def _setup_failed(self, msg, tb):
-        self.btn_dl.setEnabled(True); self.btn_pause.setEnabled(False); self._refresh_setup()
-        if msg == "cancelled":
-            self.setup_status.setText("Paused — tap Download to resume."); self.btn_dl.setText("Resume")
-        else:
-            self.setup_status.setText(f"Download failed: {msg}\nCheck the internet connection and tap Download to retry (it resumes).")
-
-    def _import_models(self):
-        d = QFileDialog.getExistingDirectory(self, "Folder that contains the .onnx model files")
-        if not d: return
-        got = self.store.import_from(d, [s for s, _, _ in self.setup_rows.values()])
-        self._refresh_setup()
-        QMessageBox.information(self, "Import", f"Imported: {', '.join(got)}" if got else "No matching model files (name + SHA-256) in that folder.")
-
-    # ------------------------------------------------------------------ main
+    # ------------------------------------------------------------------ main wizard
     def _page_main(self):
-        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(16, 12, 16, 12); lay.setSpacing(10)
-        mode_row = QHBoxLayout(); mode_row.setSpacing(8)
-        mode_row.addWidget(label("Mode", "section"))
-        self.btn_mode_video = button("Video swap", "primary", 160)
-        self.btn_mode_photo = button("Photo swap", None, 160)
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(20, 12, 20, 12); lay.setSpacing(10)
+
+        # Mode toggle — obvious Photo | Video
+        mode_row = QHBoxLayout(); mode_row.setSpacing(10)
+        mode_row.addWidget(label("1", "stepnum"))
+        mode_row.addWidget(label("What are you swapping?", "steplabel"))
+        mode_row.addStretch(1)
+        self.btn_mode_video = button("Video", "mode", 160); self.btn_mode_video.setCheckable(True); self.btn_mode_video.setChecked(True)
+        self.btn_mode_photo = button("Photo", "mode", 160); self.btn_mode_photo.setCheckable(True)
+        self._mode_group = QButtonGroup(self); self._mode_group.setExclusive(True)
+        self._mode_group.addButton(self.btn_mode_video); self._mode_group.addButton(self.btn_mode_photo)
         self.btn_mode_video.clicked.connect(lambda: self._set_mode("video"))
         self.btn_mode_photo.clicked.connect(lambda: self._set_mode("photo"))
-        mode_row.addWidget(self.btn_mode_video); mode_row.addWidget(self.btn_mode_photo); mode_row.addStretch(1)
+        mode_row.addWidget(self.btn_mode_video); mode_row.addWidget(self.btn_mode_photo)
         lay.addLayout(mode_row)
-        row = QHBoxLayout(); row.setSpacing(12)
-        self.vslot = ImageSlot("1 · Target video / photo", "Tap to choose a video or photo\nor drop it here", 600, 262)
+
+        # Step 2 — pick target + faces (side by side, huge tap targets)
+        pick = QHBoxLayout(); pick.setSpacing(12)
+        left = QVBoxLayout(); left.setSpacing(6)
+        r = QHBoxLayout(); r.addWidget(label("2", "stepnum")); r.addWidget(label("Pick the target", "steplabel")); r.addStretch(1); left.addLayout(r)
+        self.vslot = ImageSlot("Target video / photo", "Tap here to choose\nthe video or photo to change", 600, 220)
         self.vslot.clicked.connect(self._pick_target); self.vslot.dropped.connect(self.open_path)
-        self.pslot = ImageSlot("2 · Photo with the faces", "Tap to choose a photo\nor drop it here", 600, 262)
+        left.addWidget(self.vslot, 1)
+        pick.addLayout(left, 1)
+
+        right = QVBoxLayout(); right.setSpacing(6)
+        r2 = QHBoxLayout(); r2.addWidget(label("3", "stepnum")); r2.addWidget(label("Pick the faces photo", "steplabel")); r2.addStretch(1); right.addLayout(r2)
+        self.pslot = ImageSlot("Faces to use", "Tap here to choose\na clear photo of the face(s)", 600, 220)
         self.pslot.clicked.connect(self._pick_photo); self.pslot.dropped.connect(self.open_path)
-        row.addWidget(self.vslot, 1); row.addWidget(self.pslot, 1); lay.addLayout(row)
-        # pairing strip + trim
-        mid = QHBoxLayout(); mid.setSpacing(12)
-        pc = card(); pl = QHBoxLayout(pc); pl.setContentsMargins(14, 8, 14, 8)
-        self.pair_box = QHBoxLayout(); self.pair_box.setSpacing(8); pl.addLayout(self.pair_box, 1)
-        self.pair_hint = label("Faces are paired left → right.", "hint", True); self.pair_box.addWidget(self.pair_hint)
-        self.btn_flip = button("⇄  Flip", None, 120); self.btn_flip.clicked.connect(self._flip); pl.addWidget(self.btn_flip)
-        mid.addWidget(pc, 3)
-        tc = card(); tl = QGridLayout(tc); tl.setContentsMargins(14, 8, 14, 8); tl.setVerticalSpacing(2)
+        right.addWidget(self.pslot, 1)
+        pick.addLayout(right, 1)
+        lay.addLayout(pick, 1)
+
+        # Step 4 — map faces with BIG thumbnails
+        map_card = card("stepcard"); ml = QVBoxLayout(map_card); ml.setContentsMargins(14, 10, 14, 10); ml.setSpacing(8)
+        mh = QHBoxLayout(); mh.addWidget(label("4", "stepnum")); mh.addWidget(label("Map faces  (who gets which face)", "steplabel")); mh.addStretch(1)
+        self.btn_flip = button("Flip pairing", None, 180); self.btn_flip.clicked.connect(self._flip); self.btn_flip.setEnabled(False); mh.addWidget(self.btn_flip)
+        ml.addLayout(mh)
+        self.pair_hint = label("Add a target and a faces photo to see the mapping.", "subtitle", True); ml.addWidget(self.pair_hint)
+        self.pair_row = QHBoxLayout(); self.pair_row.setSpacing(12); ml.addLayout(self.pair_row)
+        # trim (video only)
+        trim = QHBoxLayout(); trim.setSpacing(10)
+        self.l_start = label("Start 0:00"); self.l_len = label("Length 10 s")
         self.s_start = QSlider(Qt.Orientation.Horizontal); self.s_len = QSlider(Qt.Orientation.Horizontal)
         for s in (self.s_start, self.s_len): s.setMinimumHeight(40); s.setEnabled(False)
-        self.l_start = label("Start 0:00.0"); self.l_len = label("Length 10 s")
-        tl.addWidget(self.l_start, 0, 0); tl.addWidget(self.s_start, 0, 1); tl.addWidget(self.l_len, 1, 0); tl.addWidget(self.s_len, 1, 1)
         self.s_start.valueChanged.connect(self._trim_changed); self.s_len.valueChanged.connect(self._trim_changed)
-        self.s_start.sliderReleased.connect(self._refresh_video_faces)
-        mid.addWidget(tc, 2)
-        lay.addLayout(mid)
+        self.s_start.sliderReleased.connect(self._refresh_target_faces)
+        trim.addWidget(self.l_start); trim.addWidget(self.s_start, 2); trim.addWidget(self.l_len); trim.addWidget(self.s_len, 2)
+        ml.addLayout(trim)
+        lay.addWidget(map_card)
+
+        # Bottom actions
         bottom = QHBoxLayout(); bottom.setSpacing(12)
         self.summary = label("", "subtitle", True); bottom.addWidget(self.summary, 1)
-        self.btn_preview = button("Preview", None, 170); self.btn_preview.clicked.connect(self._preview); bottom.addWidget(self.btn_preview)
-        self.btn_start = button("▶  Swap video", "primary", 230); self.btn_start.clicked.connect(self._start); bottom.addWidget(self.btn_start)
+        self.btn_preview = button("Preview", None, 160); self.btn_preview.clicked.connect(self._preview); bottom.addWidget(self.btn_preview)
+        self.btn_start = button("Swap", "primary", 240); self.btn_start.clicked.connect(self._start); bottom.addWidget(self.btn_start)
         lay.addLayout(bottom)
+        # keep btn_pause attr so older cancel path is safe
+        self.btn_pause = QPushButton(); self.btn_pause.hide()
         return w
 
     def _set_mode(self, mode):
         self.mode = mode
-        self.btn_mode_video.setObjectName("primary" if mode == "video" else "")
-        self.btn_mode_photo.setObjectName("primary" if mode == "photo" else "")
-        for b in (self.btn_mode_video, self.btn_mode_photo):
-            b.style().unpolish(b); b.style().polish(b)
-        self.btn_start.setText("▶  Swap video" if mode == "video" else "▶  Swap photo")
-        self.vslot.title.setText("1 · Couple video" if mode == "video" else "1 · Target photo")
-        self.s_start.setVisible(mode == "video"); self.s_len.setVisible(mode == "video")
-        self.l_start.setVisible(mode == "video"); self.l_len.setVisible(mode == "video")
+        self.btn_mode_video.setChecked(mode == "video")
+        self.btn_mode_photo.setChecked(mode == "photo")
+        self.btn_start.setText("Swap video" if mode == "video" else "Swap photo")
+        self.vslot.title.setText("Target video" if mode == "video" else "Target photo")
+        for w in (self.s_start, self.s_len, self.l_start, self.l_len):
+            w.setVisible(mode == "video")
         self.btn_preview.setVisible(mode == "video")
+        # Clear opposite target when switching modes to avoid confusion
+        if mode == "photo":
+            self.info = None
+        else:
+            self.target_photo = None
         self._update_summary()
 
     def _pick_target(self):
@@ -400,13 +406,14 @@ class MainWindow(QMainWindow):
             img = detect.load_image(p)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "Photo", str(e)); return
-        self.target_photo = p; self.info = None
+        self.target_photo = p; self.info = None; self.thumb = img; self.vfaces = []
         self.vslot.set_image(img)
         self.vslot.info.setText(f"{Path(p).name}\n{img.shape[1]}×{img.shape[0]}")
+        self._refresh_target_faces()
         self._update_summary()
 
     def _pick_video(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Choose the couple video", str(Path.home() / "Videos"),
+        p, _ = QFileDialog.getOpenFileName(self, "Choose the video", str(Path.home() / "Videos"),
                                            "Videos (*.mp4 *.mov *.m4v *.mkv *.webm *.avi *.3gp);;All files (*)")
         if p: self.set_video(p)
 
@@ -420,14 +427,14 @@ class MainWindow(QMainWindow):
         if ext in VIDEO_EXT:
             self._set_mode("video"); self.set_video(p)
         elif ext in IMAGE_EXT:
-            if self.mode == "photo" and self.target_photo is None and self.photo is not None:
-                # already have source faces — treat as target
+            if self.mode == "photo" and (self.photo is not None and self.target_photo is None):
                 self.set_target_photo(p)
-            elif self.mode == "photo" and self.vslot.pixmap() is None:
+            elif self.mode == "photo" and self.target_photo is None:
                 self.set_target_photo(p)
             else:
                 self.set_photo(p)
-        else: QMessageBox.warning(self, "Unsupported file", f"{Path(p).name} isn't a video or photo this app can open.")
+        else:
+            QMessageBox.warning(self, "Unsupported file", f"{Path(p).name} isn't a video or photo this app can open.")
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls(): e.acceptProposedAction()
@@ -440,36 +447,53 @@ class MainWindow(QMainWindow):
             info = media.probe(p)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "Video", str(e)); return
-        self.info = info; self.job.analysis = None
+        self.info = info; self.target_photo = None; self.job.analysis = None; self.vfaces = []
         dur = info.duration
         self.s_start.blockSignals(True); self.s_len.blockSignals(True)
         self.s_start.setEnabled(True); self.s_len.setEnabled(True)
         self.s_start.setRange(0, max(0, int((dur - 0.5) * 10))); self.s_start.setValue(0)
         self.s_len.setRange(5, max(5, int(min(MAX_CLIP_S, dur) * 10))); self.s_len.setValue(int(min(10.0, dur) * 10))
         self.s_start.blockSignals(False); self.s_len.blockSignals(False)
-        warn = "  ·  ⚠ HDR video: colours may look flat" if info.hdr else ""
+        warn = "  ·  HDR: colours may look flat" if info.hdr else ""
         self.vslot.info.setText(f"{Path(p).name}\n{info.summary()}{warn}")
-        self._trim_changed(); self._refresh_video_faces()
+        self._trim_changed(); self._refresh_target_faces()
 
-    def _refresh_video_faces(self):
-        if not self.info: return
-        if self.worker and self.worker.isRunning():
-            # Don't start a second heavy job while Swap / Preview is running.
-            fr = media.read_frame_at(self.info.path, self.s_start.value() / 10)
-            if fr is not None:
-                self.thumb = fr; self._redraw()
+    def _busy_worker(self):
+        return bool(self.worker and self.worker.isRunning())
+
+    def _refresh_target_faces(self):
+        """Detect faces in the target (video frame or target photo) off the UI thread."""
+        if self._busy_worker():
+            # Still show a thumbnail if we can
+            if self.mode == "video" and self.info:
+                fr = media.read_frame_at(self.info.path, self.s_start.value() / 10)
+                if fr is not None: self.thumb = fr; self._redraw()
             return
-        fr = media.read_frame_at(self.info.path, self.s_start.value() / 10)
-        if fr is None: return
-        self.thumb = fr
         st = self.settings()
-        path = self.info.path
-        t0 = self.s_start.value() / 10
+        if self.mode == "video" and self.info:
+            path = self.info.path; t0 = self.s_start.value() / 10; kind = "video"
+            fr0 = media.read_frame_at(path, t0)
+            if fr0 is None: return
+            self.thumb = fr0
+        elif self.mode == "photo" and self.target_photo:
+            path = self.target_photo; t0 = 0; kind = "photo"
+            try:
+                self.thumb = detect.load_image(path)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.warning(self, "Photo", str(e)); return
+        else:
+            return
+
+        self.pair_hint.setText("Finding faces…")
+        thumb = self.thumb
 
         def work(cancelled, emit):
             eng = self.job.get_engine(); eng.prepare(None, detector=st.detector)
             detect.set_default_engine(eng, "yoloface_8n" if st.detector != "retina" else "retinaface_10g")
-            frame = media.read_frame_at(path, t0) or fr
+            if kind == "video":
+                frame = media.read_frame_at(path, t0) or thumb
+            else:
+                frame = detect.load_image(path)
             faces = detect.detect_frame(frame, 2, st.detect_opts(), engine=eng)
             faces = sorted(faces, key=lambda f: f[:, 0].mean())
             return frame, faces
@@ -481,29 +505,54 @@ class MainWindow(QMainWindow):
             self.thumb = frame; self.vfaces = faces; self._redraw()
 
         def failed(msg, tb):
-            log.warning("video face refresh failed: %s", msg)
-            self.vfaces = []; self._redraw()
+            log.warning("target face refresh failed: %s", msg)
+            self.vfaces = []
+            self.pair_hint.setText(f"Could not find faces yet: {msg}")
+            self._redraw()
 
         self.worker.done.connect(done); self.worker.failed.connect(failed)
         self.worker.start()
 
     def set_photo(self, p):
-        try:
-            ph = load_photo(p, opts=self.settings().detect_opts(), store=self.store, device=self.job.device)
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self, "Photo", str(e)); return
-        if not ph.faces:
-            QMessageBox.warning(self, "Photo", "No face found in that photo. Use a clear, front-facing photo."); return
-        self.photo = ph; self.rotation = 0; self.job.analysis = None
-        genders = ", ".join((g or "?") for g in (ph.genders or []))
-        confs = ", ".join(f"{h.confidence:.0%}" for h in (ph.hits or []))
-        extra = (f" · {genders}" if genders else "") + (f" · conf {confs}" if confs else "")
-        self.pslot.info.setText(f"{Path(p).name}\n{len(ph.faces)} face{'s' if len(ph.faces) != 1 else ''} found{extra}")
-        self._redraw()
+        """Load source faces photo — always off the UI thread (avoids hang→crash on DirectML)."""
+        if self._busy_worker():
+            QMessageBox.information(self, "Busy", "Wait for the current step to finish, then try again."); return
+        self.pslot.info.setText(f"{Path(p).name}\nFinding faces…")
+        self.pair_hint.setText("Finding faces in the faces photo…")
+        opts = self.settings().detect_opts()
+        device = self.job.device
+
+        def work(cancelled, emit):
+            return load_photo(p, opts=opts, store=self.store, device=device)
+
+        self.worker = Worker(work, self)
+
+        def done(ph):
+            if not ph.faces:
+                QMessageBox.warning(self, "Photo", "No face found in that photo. Use a clear, front-facing photo.")
+                self.pslot.info.setText(f"{Path(p).name}\nNo face found"); return
+            self.photo = ph; self.rotation = 0; self.job.analysis = None
+            genders = ", ".join((g or "?") for g in (ph.genders or []))
+            confs = ", ".join(f"{h.confidence:.0%}" for h in (ph.hits or []))
+            extra = (f" · {genders}" if genders else "") + (f" · conf {confs}" if confs else "")
+            self.pslot.info.setText(f"{Path(p).name}\n{len(ph.faces)} face{'s' if len(ph.faces) != 1 else ''} found{extra}")
+            self._redraw()
+
+        def failed(msg, tb):
+            QMessageBox.warning(self, "Photo", msg)
+            self.pslot.info.setText("Could not read that photo")
+
+        self.worker.done.connect(done); self.worker.failed.connect(failed)
+        self.worker.start()
 
     def _assign(self):
         n = len(self.photo.faces) if self.photo else 0
         return vcore.pair_single_frame(self.vfaces, n, self.rotation) if n else [-1] * len(self.vfaces)
+
+    def _clear_pair_row(self):
+        while self.pair_row.count():
+            it = self.pair_row.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
 
     def _redraw(self):
         letters = "ABCDEF"
@@ -515,29 +564,44 @@ class MainWindow(QMainWindow):
                 if getattr(self.photo, "hits", None) and i < len(self.photo.hits):
                     h = self.photo.hits[i]
                     g = (h.gender or "?")[0].upper() if h.gender else "?"
-                    lab = f"{letters[i]} {h.confidence:.0%} {g}"
+                    lab = f"{letters[i]}  {h.confidence:.0%}  {g}"
                 plabels.append(lab)
             self.pslot.set_image(draw_faces(self.photo.img, self.photo.faces, plabels, [ORANGE] * n))
         if self.thumb is not None:
             asg = self._assign()
             labels = [f"{i + 1}" + (f" ← {letters[a]}" if a >= 0 else "") for i, a in enumerate(asg)]
             self.vslot.set_image(draw_faces(self.thumb, self.vfaces, labels) if self.vfaces else self.thumb)
-        # pairing strip
-        while self.pair_box.count():
-            it = self.pair_box.takeAt(0)
-            if it.widget() and it.widget() is not self.pair_hint: it.widget().deleteLater()
+
+        self._clear_pair_row()
         if self.photo and self.vfaces:
             self.pair_hint.hide()
             for i, a in enumerate(self._assign()):
                 if a < 0: continue
-                for img, f, tag in ((self.thumb, self.vfaces[i], f"{i + 1}"), (self.photo.img, self.photo.faces[a], letters[a])):
-                    l = QLabel(); l.setPixmap(pix(face_crop(img, f), 56, 56)); l.setToolTip(tag); self.pair_box.addWidget(l)
-                    if img is self.thumb: self.pair_box.addWidget(label("←", "arrow"))
-                self.pair_box.addSpacing(18)
-            self.pair_box.addStretch(1)
+                # Target face (big)
+                box = QVBoxLayout(); box.setSpacing(4)
+                timg = QLabel(); timg.setPixmap(pix(face_crop(self.thumb, self.vfaces[i], 120), 120, 120))
+                timg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                box.addWidget(timg); box.addWidget(label(f"Target {i + 1}", "hint"))
+                wrap = QWidget(); wrap.setLayout(box); self.pair_row.addWidget(wrap)
+                arrow = label("←", "title"); arrow.setAlignment(Qt.AlignmentFlag.AlignCenter); self.pair_row.addWidget(arrow)
+                # Source face (big)
+                box2 = QVBoxLayout(); box2.setSpacing(4)
+                simg = QLabel(); simg.setPixmap(pix(face_crop(self.photo.img, self.photo.faces[a], 120), 120, 120))
+                simg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                box2.addWidget(simg); box2.addWidget(label(f"Face {letters[a]}", "hint"))
+                wrap2 = QWidget(); wrap2.setLayout(box2); self.pair_row.addWidget(wrap2)
+                self.pair_row.addSpacing(24)
+            self.pair_row.addStretch(1)
         else:
-            self.pair_box.addWidget(self.pair_hint); self.pair_hint.show()
-            self.pair_hint.setText("Faces are paired left → right. Pick a video and a photo to see who gets which face.")
+            self.pair_hint.show()
+            if not (self.info or self.target_photo):
+                self.pair_hint.setText("Step 2: pick a target.  Step 3: pick a faces photo.")
+            elif not self.photo:
+                self.pair_hint.setText("Step 3: pick a faces photo to map.")
+            elif not self.vfaces:
+                self.pair_hint.setText("Looking for faces in the target…")
+            else:
+                self.pair_hint.setText("Faces are paired left → right. Tap Flip if the mapping is wrong.")
         self.btn_flip.setEnabled(bool(self.photo and len(self.photo.faces) >= 2))
         self._update_summary()
 
@@ -554,46 +618,59 @@ class MainWindow(QMainWindow):
 
     def settings(self) -> Settings:
         enh = self.opt["enhance"]
-        if enh == "auto": enh = self.job.recommended_enhance() if self.bench_done else ("gpen256" if self.store.is_installed(ENHANCER_LIGHT) else None)
+        if enh == "auto":
+            enh = self.job.recommended_enhance() if self.bench_done else (
+                "gpen256" if self.store.is_installed(ENHANCER_LIGHT) else None)
         if enh and not self.store.is_installed(ENHANCE_SPECS[enh]): enh = None
         st = self.s_start.value() / 10 if self.info else 0.0
         ln = self.s_len.value() / 10 if self.info else 10.0
-        return Settings(start=st, length=ln, fps=self.opt["fps"], max_short=self.opt["max_short"], enhance=enh,
-                        rotation=self.rotation, device=self.job.device, out_dir=self.opt["out_dir"],
-                        min_confidence=float(self.opt.get("min_confidence", 0.62)),
-                        same_gender=bool(self.opt.get("same_gender", True)),
-                        color_match=bool(self.opt.get("color_match", True)),
-                        temporal_smooth=float(self.opt.get("temporal_smooth", 0.18)),
-                        seamless=bool(self.opt.get("seamless", False)))
+        out = self.opt["out_dir"]
+        if self.mode == "photo":
+            out = str(default_pictures_dir()) if "FaceFusion" not in out else out
+        return Settings(
+            start=st, length=ln, fps=self.opt["fps"], max_short=self.opt["max_short"], enhance=enh,
+            rotation=self.rotation, device=self.job.device, out_dir=out,
+            min_confidence=float(self.opt.get("min_confidence", 0.62)),
+            same_gender=bool(self.opt.get("same_gender", True)),
+            color_match=bool(self.opt.get("color_match", True)),
+            temporal_smooth=float(self.opt.get("temporal_smooth", 0.18)),
+            seamless=bool(self.opt.get("seamless", False)),
+        )
 
     def _update_summary(self):
         st = self.settings()
         parts = []
-        if self.info:
+        if self.mode == "video" and self.info:
             W, H, _ = vcore.out_size(self.info.width, self.info.height, st.max_short, st.align)
             fps = st.effective_fps(self.info.fps)
             ln = min(st.length, self.info.duration - st.start)
             n = int(ln * fps); faces = min(2, len(self.photo.faces)) if self.photo else 2
             est = self.job.estimate(n, faces, st.enhance, W, H)
-            parts.append(f"{W}×{H} · {fps:.3g} fps · {n} frames · Enhance {ENHANCE_LABEL[st.enhance]}"
-                         + ("" if self.opt["enhance"] != "auto" else " (auto)"))
-            parts.append(f"≈ {media.fmt_time(est)[:-2]} on {'GPU' if self.job.engine and self.job.engine.info.active == 'DirectML' else 'this PC'}"
-                         + ("" if self.bench_done else " (estimate before speed test)"))
+            parts.append(f"{W}×{H} · {fps:.3g} fps · {n} frames · {ENHANCE_LABEL[st.enhance]}")
+            parts.append(f"About {media.fmt_time(est)[:-2]}" + ("" if self.bench_done else " (estimate)"))
+        elif self.mode == "photo":
+            parts.append(f"Photo swap · Enhance {ENHANCE_LABEL[st.enhance]}")
+            if self.target_photo: parts.append(Path(self.target_photo).name)
         else:
-            parts.append(f"Output up to {st.max_short}p · {st.fps:.0f} fps · Enhance {ENHANCE_LABEL[st.enhance]}")
+            parts.append(f"Up to {st.max_short}p · {st.fps:.0f} fps · {ENHANCE_LABEL[st.enhance]}")
         self.summary.setText("\n".join(parts))
-        ready = bool(self.info and self.photo)
-        self.btn_start.setEnabled(ready); self.btn_preview.setEnabled(ready)
+        # CRITICAL: photo mode must enable Swap when target_photo + photo are set
+        if self.mode == "photo":
+            ready = bool(self.target_photo and self.photo and self.photo.faces)
+        else:
+            ready = bool(self.info and self.photo and self.photo.faces)
+        self.btn_start.setEnabled(ready and not self._busy_worker())
+        self.btn_preview.setEnabled(bool(self.mode == "video" and self.info and self.photo) and not self._busy_worker())
 
-    # ------------------------------------------------------------------ benchmark
+    # ------------------------------------------------------------------ bench
     def _start_bench(self):
-        if self.bench_done or (self.worker and self.worker.isRunning()): return
+        if self.bench_done or self._busy_worker(): return
         self.chip.setText("Measuring speed…")
-
         def work(cancelled, emit):
             return self.job.benchmark()
         self.bw = Worker(work, self)
-        self.bw.done.connect(self._bench_done); self.bw.failed.connect(lambda m, t: (self.set_chip(), self.chip.setToolTip(m)))
+        self.bw.done.connect(self._bench_done)
+        self.bw.failed.connect(lambda m, t: (self.set_chip(), self.chip.setToolTip(m)))
         self.bw.start()
 
     def _bench_done(self, b):
@@ -608,26 +685,24 @@ class MainWindow(QMainWindow):
         self.prev_imgs = []
         for t in ("Before", "After"):
             c = card(); cl = QVBoxLayout(c); cl.setContentsMargins(10, 8, 10, 10); cl.addWidget(label(t, "section"))
-            im = image_label(420); cl.addWidget(im, 1)
-            row.addWidget(c, 1); self.prev_imgs.append(im)
+            im = image_label(420); cl.addWidget(im, 1); row.addWidget(c, 1); self.prev_imgs.append(im)
         lay.addLayout(row, 1)
         self.prev_info = label("", "subtitle", True); lay.addWidget(self.prev_info)
         b = QHBoxLayout()
-        back = button("‹  Back", None, 150); back.clicked.connect(lambda: self.go(PAGE_MAIN)); b.addWidget(back)
-        fl = button("⇄  Flip", None, 150); fl.clicked.connect(lambda: (self._flip(), self._preview())); b.addWidget(fl)
+        back = button("Back", None, 150); back.clicked.connect(lambda: self.go(PAGE_MAIN)); b.addWidget(back)
+        fl = button("Flip", None, 150); fl.clicked.connect(lambda: (self._flip(), self._preview())); b.addWidget(fl)
         b.addStretch(1)
-        go = button("▶  Swap video", "primary", 230); go.clicked.connect(self._start); b.addWidget(go)
+        go = button("Swap video", "primary", 230); go.clicked.connect(self._start); b.addWidget(go)
         lay.addLayout(b)
         return w
 
     def _preview(self):
-        if not (self.info and self.photo) or (self.worker and self.worker.isRunning()): return
+        if not (self.info and self.photo) or self._busy_worker(): return
         st = self.settings()
         self.btn_preview.setText("Working…"); self.btn_preview.setEnabled(False)
-        t = self.s_start.value() / 10
-
         def work(cancelled, emit):
-            t0 = time.perf_counter(); r = self.job.preview(self.info, self.photo, st, t); return r, time.perf_counter() - t0, st
+            t0 = time.perf_counter(); r = self.job.preview(self.info, self.photo, st, self.s_start.value() / 10)
+            return r, time.perf_counter() - t0, st
         self.worker = Worker(work, self)
         self.worker.done.connect(self._preview_done); self.worker.failed.connect(self._failed)
         self.worker.start()
@@ -639,119 +714,81 @@ class MainWindow(QMainWindow):
         self.prev_imgs[0].setPixmap(pix(draw_faces(before, dets, labels) if dets else before, 600, 420))
         self.prev_imgs[1].setPixmap(pix(after, 600, 420))
         self.prev_title.setText(f"Preview at {media.fmt_time(st.start)}")
-        self.prev_info.setText(f"{after.shape[1]}×{after.shape[0]} · Enhance {ENHANCE_LABEL[st.enhance]} · {len([a for a in asg if a >= 0])} face(s) · "
-                               f"{secs:.1f} s incl. model loading · {self.job.engine.info.label()}")
+        self.prev_info.setText(
+            f"{after.shape[1]}×{after.shape[0]} · {ENHANCE_LABEL[st.enhance]} · "
+            f"{len([a for a in asg if a >= 0])} face(s) · {secs:.1f} s · {self.job.engine.info.label()}")
         self.btn_preview.setText("Preview"); self.btn_preview.setEnabled(True)
         self.set_chip(); self.go(PAGE_PREVIEW)
 
     # ------------------------------------------------------------------ options
     def _page_options(self):
-        w = QWidget(); outer = QVBoxLayout(w); outer.setContentsMargins(0, 0, 0, 0)
-        sc = QScrollArea(); sc.setWidgetResizable(True); inner = QWidget(); lay = QVBoxLayout(inner)
-        lay.setContentsMargins(24, 14, 24, 14); lay.setSpacing(8)
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(24, 14, 24, 14); lay.setSpacing(12)
         lay.addWidget(label("Options", "title"))
-        lay.addWidget(label("Output resolution (short side; never upscales)", "section"))
-        self.seg_res = Segmented([("480p", 480), ("720p", 720), ("1080p", 1080)]); lay.addWidget(self.seg_res)
-        self.seg_res.changed.connect(lambda v: self._set_opt("max_short", v))
-        lay.addWidget(label("Frame rate (never above the source)", "section"))
-        self.seg_fps = Segmented([("15 fps", 15.0), ("24 fps", 24.0), ("30 fps", 30.0), ("Original", 0.0)]); lay.addWidget(self.seg_fps)
-        self.seg_fps.changed.connect(lambda v: self._set_opt("fps", v))
-        lay.addWidget(label("Enhance face detail", "section"))
-        self.seg_enh = Segmented([("Auto", "auto"), ("Off", None), ("Light", "gpen256"), ("HQ", "gpen512")]); lay.addWidget(self.seg_enh)
-        self.seg_enh.changed.connect(lambda v: self._set_opt("enhance", v))
-        self.enh_info = label("", "hint", True); lay.addWidget(self.enh_info)
-        lay.addWidget(label("Processor", "section"))
-        self.seg_dev = Segmented([("Auto (GPU if possible)", "auto"), ("GPU (DirectML)", "dml"), ("CPU only", "cpu")]); lay.addWidget(self.seg_dev)
-        self.seg_dev.changed.connect(self._set_device)
-        self.dev_info = label("", "hint", True); lay.addWidget(self.dev_info)
-        lay.addWidget(label("Face detection (v2)", "section"))
-        self.seg_conf = Segmented([("Strict 70%", 0.70), ("Default 62%", 0.62), ("Loose 50%", 0.50)])
-        lay.addWidget(self.seg_conf)
-        self.seg_conf.changed.connect(lambda v: self._set_opt("min_confidence", v))
-        self.chk_gender = QCheckBox("Same-gender match (recommended)")
-        self.chk_gender.setChecked(True)
-        self.chk_gender.stateChanged.connect(lambda _=0: self._set_opt("same_gender", self.chk_gender.isChecked()))
-        lay.addWidget(self.chk_gender)
-        self.chk_color = QCheckBox("Match skin / body colour + soft hairline blend")
-        self.chk_color.setChecked(True)
-        self.chk_color.stateChanged.connect(lambda _=0: self._set_opt("color_match", self.chk_color.isChecked()))
-        lay.addWidget(self.chk_color)
-        self.chk_seam = QCheckBox("Seamless (Poisson) blend — slower, stronger hairline")
-        self.chk_seam.stateChanged.connect(lambda _=0: self._set_opt("seamless", self.chk_seam.isChecked()))
-        lay.addWidget(self.chk_seam)
-        lay.addWidget(label("Temporal smooth (cuts flicker; landmarks still follow expression)", "section"))
-        self.seg_smooth = Segmented([("Off", 0.0), ("Light", 0.12), ("Medium", 0.18), ("Strong", 0.30)])
-        lay.addWidget(self.seg_smooth)
-        self.seg_smooth.changed.connect(lambda v: self._set_opt("temporal_smooth", v))
-        lay.addWidget(label("Expression follows the video person every frame (mouth open/smile/blink). "
-                            "Source photo is identity only — not a frozen face paste.", "hint", True))
-        lay.addWidget(label("Save to", "section"))
+        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget(); il = QVBoxLayout(inner); il.setSpacing(14)
 
-        r = QHBoxLayout(); self.out_label = label("", None, True); r.addWidget(self.out_label, 1)
-        ch = button("Change…"); ch.clicked.connect(self._change_out); r.addWidget(ch)
-        op = button("Open folder"); op.clicked.connect(lambda: self._open_folder(self.opt["out_dir"])); r.addWidget(op)
-        lay.addLayout(r)
-        r2 = QHBoxLayout(); mm = button("Manage models…"); mm.clicked.connect(lambda: (self._refresh_setup(), self.go(PAGE_SETUP))); r2.addWidget(mm); r2.addStretch(1)
-        lay.addLayout(r2)
-        lay.addStretch(1)
-        sc.setWidget(inner); outer.addWidget(sc, 1)
-        bar = QHBoxLayout(); bar.setContentsMargins(24, 6, 24, 12)
-        done = button("‹  Done", "primary", 200); done.clicked.connect(lambda: self.go(PAGE_MAIN)); bar.addWidget(done); bar.addStretch(1)
-        outer.addLayout(bar)
+        def add_seg(title, items, key, cast=lambda x: x):
+            il.addWidget(label(title, "section"))
+            seg = Segmented(items); seg.set(self.opt.get(key))
+            seg.changed.connect(lambda v, k=key, c=cast: self._set_opt(k, c(v)))
+            il.addWidget(seg); return seg
+
+        self.seg_res = add_seg("Max short side", [("480p", 480), ("720p", 720), ("1080p", 1080)], "max_short", int)
+        self.seg_fps = add_seg("FPS", [("15", 15), ("24", 24), ("30", 30), ("Source", 0)], "fps", float)
+        self.seg_enh = add_seg("Enhance", [("Off", None), ("Auto", "auto"), ("Light", "gpen256"), ("HQ", "gpen512")], "enhance")
+        il.addWidget(label("Processor", "section"))
+        self.seg_dev = Segmented([("Auto", "auto"), ("GPU (DirectML)", "dml"), ("CPU", "cpu")])
+        self.seg_dev.set(self.job.device); self.seg_dev.changed.connect(self._set_device); il.addWidget(self.seg_dev)
+        self.dev_info = label("", "hint", True); il.addWidget(self.dev_info)
+        self.enh_info = label("", "hint", True); il.addWidget(self.enh_info)
+
+        self.chk_gender = QCheckBox("Prefer same gender when mapping"); self.chk_gender.setChecked(self.opt["same_gender"])
+        self.chk_gender.stateChanged.connect(lambda _=0: self._set_opt("same_gender", self.chk_gender.isChecked())); il.addWidget(self.chk_gender)
+        self.chk_color = QCheckBox("Match skin colour"); self.chk_color.setChecked(self.opt["color_match"])
+        self.chk_color.stateChanged.connect(lambda _=0: self._set_opt("color_match", self.chk_color.isChecked())); il.addWidget(self.chk_color)
+        self.chk_seam = QCheckBox("Seamless blend (slower)"); self.chk_seam.setChecked(self.opt["seamless"])
+        self.chk_seam.stateChanged.connect(lambda _=0: self._set_opt("seamless", self.chk_seam.isChecked())); il.addWidget(self.chk_seam)
+
+        r = QHBoxLayout(); self.out_label = label(self.opt["out_dir"], "hint", True); r.addWidget(self.out_label, 1)
+        ch = button("Change folder…"); ch.clicked.connect(self._change_out); r.addWidget(ch); il.addLayout(r)
+        mm = button("Manage models…"); mm.clicked.connect(lambda: (self._refresh_setup(), self.go(PAGE_SETUP))); il.addWidget(mm)
+        il.addStretch(1); sc.setWidget(inner); lay.addWidget(sc, 1)
+        done = button("Done", "primary", 200); done.clicked.connect(lambda: self.go(PAGE_MAIN)); lay.addWidget(done, 0, Qt.AlignmentFlag.AlignLeft)
         return w
 
     def _set_opt(self, k, v):
-        self.opt[k] = v; self.cfg.setValue(k, v if v is not None else "off"); self.job.analysis = None if k in ("max_short", "fps", "min_confidence", "same_gender") else self.job.analysis
-        self._refresh_options()
+        self.opt[k] = v; self.cfg.setValue(k, v if v is not None else "off"); self._update_summary()
 
     def _set_device(self, v):
-        self.cfg.setValue("device", v); self.job.get_engine(v); self.bench_done = False
-        self.set_chip(); self._refresh_options(); self._start_bench()
+        self.job.device = v; self.cfg.setValue("device", v)
+        if self.job.engine: self.job.engine.close(); self.job.engine = None
+        self.bench_done = False; self.set_chip(); QTimer.singleShot(100, self._start_bench)
 
     def _change_out(self):
-        d = QFileDialog.getExistingDirectory(self, "Save videos to", self.opt["out_dir"])
-        if d: self._set_opt("out_dir", d)
+        d = QFileDialog.getExistingDirectory(self, "Output folder", self.opt["out_dir"])
+        if d: self._set_opt("out_dir", d); self.out_label.setText(d)
 
     def _refresh_options(self):
-        if self.opt["enhance"] == "off": self.opt["enhance"] = None
-        self.seg_res.set(self.opt["max_short"]); self.seg_fps.set(self.opt["fps"]); self.seg_enh.set(self.opt["enhance"])
-        self.seg_dev.set(self.job.device)
-        if hasattr(self, "seg_conf"):
-            # pick nearest preset
-            c = float(self.opt.get("min_confidence", 0.62))
-            best = min(self.seg_conf.buttons.keys(), key=lambda v: abs(v - c))
-            self.seg_conf.set(best)
-            self.chk_gender.setChecked(bool(self.opt.get("same_gender", True)))
-            self.chk_color.setChecked(bool(self.opt.get("color_match", True)))
-            self.chk_seam.setChecked(bool(self.opt.get("seamless", False)))
-            sm = float(self.opt.get("temporal_smooth", 0.18))
-            bests = min(self.seg_smooth.buttons.keys(), key=lambda v: abs(v - sm))
-            self.seg_smooth.set(bests)
-        for m, spec in ENHANCE_SPECS.items():
-            b = self.seg_enh.buttons[m]; inst = self.store.is_installed(spec)
-            b.setText(f"{ENHANCE_LABEL[m]}" + ("" if inst else f"  (download {spec.bytes / 1e6:.0f} MB)"))
-            b.setEnabled(inst)
-        n = 300; lines = []
-        if self.info:
-            fps = Settings(fps=self.opt["fps"]).effective_fps(self.info.fps); n = int(min(10, self.info.duration) * fps)
+        lines = []
+        n = 300
         W, H = (1920, 1080) if self.opt["max_short"] >= 1080 else ((1280, 720) if self.opt["max_short"] >= 720 else (854, 480))
         for m in (None, "gpen256", "gpen512"):
             if m and not self.store.is_installed(ENHANCE_SPECS[m]): continue
             lines.append(f"{ENHANCE_LABEL[m]} ≈ {media.fmt_time(self.job.estimate(n, 2, m, W, H))[:-2]}")
         rec = self.job.recommended_enhance()
-        self.enh_info.setText(("Estimated time for a 10 s clip with 2 faces: " + " · ".join(lines)) +
-                              (f".  Auto picks {ENHANCE_LABEL[rec]} on this device." if self.bench_done else ".  (Speed test pending.)") +
-                              "\nLight = GPEN-256 (sharper face, small cost). HQ = GPEN-512 (best detail; fast on the GPU, slow on CPU).")
+        self.enh_info.setText(("10 s clip estimate: " + " · ".join(lines)) +
+                              (f".  Auto picks {ENHANCE_LABEL[rec]}." if self.bench_done else "."))
         eng = self.job.engine
         self.dev_info.setText(("Now using: " + eng.info.label()) if eng else "")
         self.out_label.setText(self.opt["out_dir"])
 
-    # ------------------------------------------------------------------ run
+    # ------------------------------------------------------------------ progress / run
     def _page_progress(self):
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(24, 14, 24, 14); lay.setSpacing(10)
-        self.prog_title = label("Swapping faces…", "title"); lay.addWidget(self.prog_title)
+        self.prog_title = label("Working…", "title"); lay.addWidget(self.prog_title)
         self.steps = label("", "subtitle"); lay.addWidget(self.steps)
-        self.prog_bar = QProgressBar(); self.prog_bar.setRange(0, 1000); self.prog_bar.setTextVisible(False); self.prog_bar.setMinimumHeight(28); lay.addWidget(self.prog_bar)
+        self.prog_bar = QProgressBar(); self.prog_bar.setRange(0, 1000); self.prog_bar.setTextVisible(False)
+        self.prog_bar.setMinimumHeight(28); lay.addWidget(self.prog_bar)
         self.prog_text = label("", "section"); lay.addWidget(self.prog_text)
         row = QHBoxLayout(); row.setSpacing(12)
         self.prog_imgs = []
@@ -765,63 +802,72 @@ class MainWindow(QMainWindow):
         return w
 
     def _start(self):
-        if self.worker and self.worker.isRunning(): return
+        if self._busy_worker(): return
         if self.mode == "photo":
             if not (self.target_photo and self.photo): return
         elif not (self.info and self.photo):
             return
         st = self.settings()
-        if self.mode == "photo":
-            from ..job import default_pictures_dir
-            st.out_dir = st.out_dir if "FaceFusion" in st.out_dir else str(default_pictures_dir())
         self.prog_bar.setValue(0); self.prog_text.setText("Starting…"); self.btn_cancel.setEnabled(True)
         for im in self.prog_imgs: im.clear()
         self._steps("detect")
         self.go(PAGE_PROGRESS); self.run_t0 = time.time()
         mode = self.mode; target = self.target_photo; info = self.info; photo = self.photo
+
         def work(cancelled, emit):
             if mode == "photo":
                 return self.job.run_photo(target, photo, st, progress=emit, cancel=cancelled)
             return self.job.run(info, photo, st, progress=emit, cancel=cancelled)
+
         self.worker = Worker(work, self)
-        self.worker.progressed.connect(self._progress); self.worker.done.connect(self._finished); self.worker.failed.connect(self._failed)
+        self.worker.progressed.connect(self._progress)
+        self.worker.done.connect(self._finished)
+        self.worker.failed.connect(self._failed)
         self.worker.start()
 
     def _steps(self, cur):
-        names = [("detect", "1  Find & track faces"), ("swap", "2  Swap faces"), ("mux", "3  Save MP4 + sound")]
-        order = [n for n, _ in names]; ci = order.index(cur) if cur in order else 3
+        if self.mode == "photo":
+            names = [("detect", "1  Find faces"), ("swap", "2  Swap"), ("mux", "3  Save photo")]
+        else:
+            names = [("detect", "1  Find & track faces"), ("swap", "2  Swap faces"), ("mux", "3  Save MP4 + sound")]
+        order = [n for n, _ in names]; ci = order.index(cur) if cur in order else len(order)
         self.steps.setText("     ".join(("✓ " if i < ci else ("● " if i == ci else "○ ")) + t for i, (n, t) in enumerate(names)))
 
     def _progress(self, d):
         stage = d.get("stage"); done, total = d.get("done", 0), max(1, d.get("total", 1))
         if stage in ("detect", "swap", "mux"): self._steps(stage)
         if stage == "detect":
-            self.prog_bar.setValue(int(150 * done / total)); self.prog_text.setText(f"Finding faces · frame {done} of {total}")
+            self.prog_title.setText("Finding faces…")
+            self.prog_bar.setValue(int(150 * done / total))
+            self.prog_text.setText(d.get("detail") or f"Finding faces · {done} of {total}")
         elif stage == "swap":
+            self.prog_title.setText("Swapping faces…")
             self.prog_bar.setValue(150 + int(830 * done / total))
             eta = d.get("eta"); rate = d.get("rate") or 0
-            self.prog_text.setText(f"Frame {done} of {total} · {rate:.1f} frames/s" + (f" · about {media.fmt_time(eta)[:-2]} left" if eta else ""))
+            self.prog_text.setText(d.get("detail") or (
+                f"Frame {done} of {total} · {rate:.1f} frames/s" + (f" · about {media.fmt_time(eta)[:-2]} left" if eta else "")))
         elif stage == "mux":
-            # Final / Finalize — keep the bar moving and show the real sub-step.
+            self.prog_title.setText("Final — saving…")
             frac = done / total if total else 0.0
             self.prog_bar.setValue(980 + int(20 * min(1.0, frac)))
-            detail = d.get("detail") or "Saving MP4 and copying the sound…"
-            self.prog_text.setText(detail)
-            self.prog_title.setText("Final — saving your video…")
+            self.prog_text.setText(d.get("detail") or "Saving…")
         if "thumb" in d:
-            self.prog_imgs[0].setPixmap(pix(d["before"], 600, 330)); self.prog_imgs[1].setPixmap(pix(d["thumb"], 600, 330))
-        if self.job.engine: self.prog_dev.setText(f"{self.job.engine.info.label()} · elapsed {media.fmt_time(time.time() - self.run_t0)[:-2]}"); self.set_chip()
+            self.prog_imgs[0].setPixmap(pix(d.get("before"), 600, 330))
+            self.prog_imgs[1].setPixmap(pix(d["thumb"], 600, 330))
+        if self.job.engine:
+            self.prog_dev.setText(f"{self.job.engine.info.label()} · elapsed {media.fmt_time(time.time() - self.run_t0)[:-2]}")
+            self.set_chip()
 
     def _cancel(self):
         if self.worker and self.worker.isRunning():
             self.worker.cancelled = True; self.prog_text.setText("Cancelling…"); self.btn_cancel.setEnabled(False)
-            self.btn_pause.setEnabled(False)
+            if hasattr(self, "btn_pause"): self.btn_pause.setEnabled(False)
 
     def _failed(self, msg, tb):
         self.btn_preview.setText("Preview"); self.btn_preview.setEnabled(True)
         self.btn_cancel.setEnabled(True)
         if msg == "cancelled":
-            self.go(PAGE_MAIN); return
+            self.go(PAGE_MAIN); self._update_summary(); return
         box = QMessageBox(self); box.setIcon(QMessageBox.Icon.Warning); box.setWindowTitle("Something went wrong")
         hint = ""
         try:
@@ -833,43 +879,62 @@ class MainWindow(QMainWindow):
         box.setDetailedText(tb or "")
         box.exec()
         self.go(PAGE_MAIN if self.store.all_installed() else PAGE_SETUP)
+        self._update_summary()
 
     # ------------------------------------------------------------------ done
     def _page_done(self):
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(24, 14, 24, 14); lay.setSpacing(10)
-        lay.addWidget(label("Done! Your video is saved.", "title"))
-        self.done_path = label("", "section", True); self.done_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); lay.addWidget(self.done_path)
+        self.done_title = label("Done!", "title"); lay.addWidget(self.done_title)
+        self.done_path = label("", "section", True)
+        self.done_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); lay.addWidget(self.done_path)
         self.done_img = image_label(390); lay.addWidget(self.done_img, 1)
         self.done_info = label("", "subtitle", True); lay.addWidget(self.done_info)
         b = QHBoxLayout(); b.setSpacing(12)
-        play = button("▶  Play", "primary", 180); play.clicked.connect(lambda: self.result and QDesktopServices.openUrl(QUrl.fromLocalFile(self.result["path"]))); b.addWidget(play)
-        fold = button("Open folder", None, 180); fold.clicked.connect(lambda: self.result and self._open_folder(self.result["path"], select=True)); b.addWidget(fold)
-        redo = button("⇄  Flip && redo", None, 180); redo.clicked.connect(lambda: (self._flip(), self._start())); b.addWidget(redo)
+        play = button("Open result", "primary", 200)
+        play.clicked.connect(lambda: self.result and QDesktopServices.openUrl(QUrl.fromLocalFile(self.result["path"])))
+        b.addWidget(play)
+        fold = button("Open folder", None, 180)
+        fold.clicked.connect(lambda: self.result and self._open_folder(self.result["path"], select=True)); b.addWidget(fold)
+        redo = button("Flip & redo", None, 180); redo.clicked.connect(lambda: (self._flip(), self._start())); b.addWidget(redo)
         b.addStretch(1)
-        new = button("New video", None, 160); new.clicked.connect(lambda: self.go(PAGE_MAIN)); b.addWidget(new)
+        new = button("New", None, 140); new.clicked.connect(lambda: self.go(PAGE_MAIN)); b.addWidget(new)
         lay.addLayout(b)
         return w
 
     def _finished(self, res):
         self.result = res
         self.done_path.setText(res["path"])
-        if res.get("mode") == "photo":
-            fr = res.get("after") or detect.load_image(res["path"])
+        is_photo = res.get("mode") == "photo"
+        self.done_title.setText("Done! Your photo is saved." if is_photo else "Done! Your video is saved.")
+        if is_photo:
+            fr = res.get("after")
+            if fr is None:
+                try: fr = detect.load_image(res["path"])
+                except Exception:  # noqa: BLE001
+                    fr = None
+            if fr is not None and res.get("before") is not None and res["before"].shape == fr.shape:
+                fr = np.hstack([res["before"], np.full((fr.shape[0], 12, 3), 18, np.uint8), fr])
         else:
-            fr = media.read_frame_at(res["path"], res.get("duration", 1) / 2)
-        src = None
-        if fr is not None and self.info:
-            s0 = media.read_frame_at(self.info.path, self.s_start.value() / 10 + res["duration"] / 2)
-            if s0 is not None:
-                W, H, s = vcore.out_size(self.info.width, self.info.height, self.settings().max_short, 2)
-                src = vcore.prep(s0, W, H, s)
-                if src.shape == fr.shape:
-                    fr = np.hstack([src, np.full((src.shape[0], 12, 3), 18, np.uint8), fr])
+            fr = media.read_frame_at(res["path"], max(0.01, res.get("duration", 1) / 2))
+            if fr is not None and self.info:
+                s0 = media.read_frame_at(self.info.path, self.s_start.value() / 10 + res.get("duration", 1) / 2)
+                if s0 is not None:
+                    W, H, s = vcore.out_size(self.info.width, self.info.height, self.settings().max_short, 2)
+                    src = vcore.prep(s0, W, H, s)
+                    if src is not None and src.shape == fr.shape:
+                        fr = np.hstack([src, np.full((src.shape[0], 12, 3), 18, np.uint8), fr])
         if fr is not None: self.done_img.setPixmap(pix(fr, 1200, 390))
-        mb = res["size"] / 1e6
-        self.done_info.setText(f"{res['W']}×{res['H']} · {res['fps']:.3g} fps · {media.fmt_time(res['duration'])} · {mb:.1f} MB · "
-                               f"Enhance {res['enhance']} · {res['audio']}\nTook {media.fmt_time(res['total_s'])[:-2]} on {res['device']} "
-                               f"(encoder {res['encoder']})")
+        mb = res.get("size", 0) / 1e6
+        if is_photo:
+            self.done_info.setText(
+                f"{res.get('W', '?')}×{res.get('H', '?')} · {mb:.1f} MB · Enhance {res.get('enhance')}\n"
+                f"Took {media.fmt_time(res.get('total_s', 0))[:-2]} on {res.get('device', '?')}")
+        else:
+            self.done_info.setText(
+                f"{res.get('W','?')}×{res.get('H','?')} · {res.get('fps', 0):.3g} fps · "
+                f"{media.fmt_time(res.get('duration', 0))} · {mb:.1f} MB · Enhance {res.get('enhance')} · {res.get('audio', '')}\n"
+                f"Took {media.fmt_time(res.get('total_s', 0))[:-2]} on {res.get('device', '?')} "
+                f"(encoder {res.get('encoder', '?')})")
         self.go(PAGE_DONE)
 
     def _open_folder(self, p, select=False):
@@ -880,7 +945,6 @@ class MainWindow(QMainWindow):
         Path(p if not select else Path(p).parent).mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(p if not select else str(Path(p).parent)))
 
-    # ------------------------------------------------------------------ keys (keyboard + gamepad)
     def keyPressEvent(self, e: QKeyEvent):
         page = self.stack.currentIndex(); k = e.key()
         if k == Qt.Key.Key_Escape:
@@ -904,19 +968,13 @@ class MainWindow(QMainWindow):
 
 
 EXTRA_QSS = """
-QFrame#topbar { background:#0d0f14; border-bottom:1px solid #2a2f3a; }
-QLabel#apptitle { font-size:19px; font-weight:600; color:#fff; background:transparent; }
-QLabel#chip { background:#243b39; color:#7fe3d9; border-radius:13px; padding:5px 12px; font-size:13px; }
+QFrame#topbar { background:#0a0c10; border-bottom:1px solid #2a3140; }
+QLabel#apptitle { font-size:20px; font-weight:700; color:#fff; background:transparent; }
+QLabel#chip { background:#243b39; color:#7fe3d9; border-radius:14px; padding:6px 14px; font-size:14px; font-weight:600; }
 QLabel#chip[state="cpu"] { background:#3b3324; color:#ffcf8a; }
-QLabel#section { font-size:16px; font-weight:600; color:#e8eaed; background:transparent; }
-QLabel#slot { background:#12151c; border:2px dashed #3c4454; border-radius:12px; color:#80868b; font-size:16px; }
-QLabel#arrow { font-size:22px; color:#9aa0a6; background:transparent; }
-QFrame#card QLabel { background:transparent; }
-QPushButton#seg { background:#1f232c; border:1px solid #3c4454; border-radius:10px; font-size:15px; }
-QPushButton#seg:checked { background:#00b8a9; color:#041014; border:none; font-weight:600; }
-QPushButton#seg:disabled { color:#5f6368; }
-QCheckBox { spacing:12px; font-size:15px; background:transparent; min-height:40px; }
-QCheckBox::indicator { width:28px; height:28px; }
+QLabel#slot { background:#12151c; border:2px dashed #3c4454; border-radius:14px; color:#9aa0a6; font-size:16px; }
+QPushButton#seg { background:#1f232c; border:1px solid #3c4454; border-radius:12px; font-size:16px; }
+QPushButton#seg:checked { background:#00b8a9; color:#041014; border:none; font-weight:700; }
 QPushButton:focus, QCheckBox:focus, QSlider:focus { outline:none; border:2px solid #ff8a3d; }
 QMessageBox QLabel { background:transparent; }
 """
@@ -924,9 +982,15 @@ QMessageBox QLabel { background:transparent; }
 
 def make_app(argv=None):
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+    # Prefer fonts that exist on every Windows 11 / Ally X image (avoids tofu □□□)
+    os.environ.setdefault("QT_QPA_FONTDIR", "")
     app = QApplication.instance() or QApplication(argv or sys.argv)
     app.setApplicationName("Face Fusion Studio"); app.setOrganizationName("vanu")
-    app.setStyle("Fusion"); app.setStyleSheet(DARK_QSS + EXTRA_QSS)
+    app.setStyle("Fusion")
+    font = QFont("Segoe UI", 11)
+    font.setStyleHint(QFont.StyleHint.SansSerif)
+    app.setFont(font)
+    app.setStyleSheet(DARK_QSS + EXTRA_QSS)
     ico = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2] / "packaging")) / "icon.ico"
     if ico.is_file(): app.setWindowIcon(QIcon(str(ico)))
     return app
@@ -945,16 +1009,14 @@ def run_gui(args=None) -> int:
         from .screens import take_screenshots
         return take_screenshots(args)
     app = make_app()
-    def _qt_msg(mode, context, message):
-        # Qt fatals used to kill silently; keep a breadcrumb in the crash log.
-        try:
-            from PySide6.QtCore import QtMsgType
-            if mode in (QtMsgType.QtFatalMsg, QtMsgType.QtCriticalMsg):
-                crashlog.record(RuntimeError, RuntimeError(f"Qt {mode}: {message}"), None, where="qt")
-        except Exception:  # noqa: BLE001
-            pass
     try:
-        from PySide6.QtCore import qInstallMessageHandler
+        from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+        def _qt_msg(mode, context, message):
+            try:
+                if mode in (QtMsgType.QtFatalMsg, QtMsgType.QtCriticalMsg):
+                    crashlog.record(RuntimeError, RuntimeError(f"Qt {mode}: {message}"), None, where="qt")
+            except Exception:  # noqa: BLE001
+                pass
         qInstallMessageHandler(_qt_msg)
     except Exception:  # noqa: BLE001
         pass
@@ -964,7 +1026,7 @@ def run_gui(args=None) -> int:
     win.gamepad = Gamepad(win)
     win.resize(1280, 720)
     if QApplication.primaryScreen() and QApplication.primaryScreen().availableGeometry().width() <= 1400:
-        win.showMaximized()          # Ally X: 1920x1080 @150% = 1280x720 logical
+        win.showMaximized()
     else:
         win.show()
     for p in (getattr(args, "video", None), getattr(args, "photo", None)):

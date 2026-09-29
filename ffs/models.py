@@ -118,6 +118,9 @@ class ModelStore:
     def all_installed(self) -> bool:
         return all(self.is_installed(s) for s in self.specs)
 
+    def missing_required(self) -> list:
+        return [s for s in self.specs if not self.is_installed(s)]
+
     def bytes_present(self) -> int:
         n = 0
         for s in self.specs:
