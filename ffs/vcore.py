@@ -13,9 +13,16 @@ import numpy as np
 
 
 def out_size(w, h, max_short=720, align=16):
+    w, h = int(w), int(h)
+    if w < 2 or h < 2:
+        raise ValueError(f"Video frame size is unusable ({w}×{h}).")
+    align = max(2, int(align))
     s = min(1.0, max_short / min(w, h))
     W, H = int(round(w * s)), int(round(h * s))
-    return W - W % align, H - H % align, s
+    W, H = W - W % align, H - H % align
+    if W < align or H < align:
+        W, H = max(align, W), max(align, H)
+    return W, H, s
 
 
 def frame_times(duration, src_fps, start, end, fps):
@@ -49,7 +56,20 @@ class SlotSelector:
 
 
 def prep(frame, W, H, s):
-    if s < 1: frame = cv2.resize(frame, (int(round(frame.shape[1] * s)), int(round(frame.shape[0] * s))), interpolation=cv2.INTER_AREA)
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return frame
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    elif frame.ndim == 3 and frame.shape[2] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    if s < 1:
+        frame = cv2.resize(frame, (max(1, int(round(frame.shape[1] * s))), max(1, int(round(frame.shape[0] * s)))), interpolation=cv2.INTER_AREA)
+    # Normal path is unchanged (centre-crop to the aligned size). If rounding left the frame
+    # smaller than the crop — or the size is degenerate — resize instead of slicing empty.
+    if W < 2 or H < 2 or frame.shape[0] < H or frame.shape[1] < W:
+        if W >= 2 and H >= 2:
+            frame = cv2.resize(frame, (int(W), int(H)), interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(frame)
     y0 = (frame.shape[0] - H) // 2; x0 = (frame.shape[1] - W) // 2
     return np.ascontiguousarray(frame[y0:y0 + H, x0:x0 + W])
 

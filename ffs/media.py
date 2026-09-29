@@ -8,14 +8,19 @@ LGPL FFmpeg has no libx264, so the encoder is picked at run time from:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+
+log = logging.getLogger("ffs")
 
 import cv2
 import numpy as np
@@ -54,7 +59,13 @@ def ffprobe():
 
 
 def run(cmd, timeout=None, check=False):
-    return subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=NO_WINDOW, check=check)
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=NO_WINDOW, check=check)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"FFmpeg timed out after {timeout}s ({' '.join(str(x) for x in cmd[:4])}…). "
+            "The Final step was stopped so the app would not hang. Try a shorter clip or CPU encode."
+        ) from e
 
 
 @dataclass
@@ -262,64 +273,214 @@ def color_args(info: VideoInfo):
 
 
 class Encoder:
-    def __init__(self, out_path, W, H, fps, info: VideoInfo, encoder=None):
+    def __init__(self, out_path, W, H, fps, info: VideoInfo, encoder=None, finalize_timeout=None):
+        if W < 2 or H < 2 or not fps or fps <= 0:
+            raise ValueError(f"Cannot encode {W}×{H} @ {fps} fps.")
         self.encoder = encoder or pick_encoder()
         self.out_path = out_path
+        self.W, self.H, self.fps = int(W), int(H), float(fps)
+        self.frame_bytes = self.W * self.H * 3
+        try:
+            default_to = float(os.environ.get("FFS_ENCODE_TIMEOUT", "300") or 300)
+        except ValueError:
+            default_to = 300.0
+        self.finalize_timeout = max(30.0, float(finalize_timeout if finalize_timeout is not None else default_to))
         vf, tags = color_args(info)
         rate = Fraction(fps).limit_denominator(1001000)
-        cmd = [ffmpeg(), "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}",
+        cmd = [ffmpeg(), "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{self.W}x{self.H}",
                "-r", f"{rate.numerator}/{rate.denominator}", "-i", "-", "-vf", vf,
-               *encoder_args(self.encoder, W, H, fps), *tags, "-an", "-movflags", "+faststart", str(out_path)]
+               *encoder_args(self.encoder, self.W, self.H, self.fps), *tags, "-an", "-movflags", "+faststart",
+               str(out_path)]
         self.err = tempfile.TemporaryFile()
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.err,
                                      creationflags=NO_WINDOW)
         self.frames = 0
+        self._closed = False
 
     def write(self, frame):
+        if self._closed:
+            raise RuntimeError("Encoder already closed.")
+        arr = np.ascontiguousarray(frame)
+        if arr.ndim != 3 or arr.shape[0] != self.H or arr.shape[1] != self.W or arr.shape[2] != 3:
+            raise RuntimeError(f"Encoder expected {self.W}×{self.H}×3 frames, got {getattr(arr, 'shape', None)}.")
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
         try:
-            self.proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            self.proc.stdin.write(arr.tobytes())
         except (BrokenPipeError, OSError) as e:
             raise RuntimeError("The video encoder stopped: " + self._err()) from e
         self.frames += 1
 
     def _err(self):
-        self.err.seek(0)
-        return self.err.read().decode("utf-8", "replace")[-400:]
-
-    def close(self):
         try:
-            self.proc.stdin.close()
-        except OSError:
-            pass
-        rc = self.proc.wait(timeout=600)
+            self.err.seek(0)
+            return self.err.read().decode("utf-8", "replace")[-400:]
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def close(self, progress=None, cancel=None):
+        """Flush stdin and wait for FFmpeg. Never blocks forever — kills on timeout / cancel."""
+        if self._closed:
+            return
+        self._closed = True
+        if progress:
+            progress(dict(stage="mux", done=0, total=1, detail="Closing the video encoder…"))
+        # Closing a large pipe can block if FFmpeg is stuck; do it on a helper thread.
+        close_err = []
+
+        def _close_stdin():
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+            except OSError as e:
+                close_err.append(e)
+
+        t = threading.Thread(target=_close_stdin, name="ffs-enc-stdin", daemon=True)
+        t.start()
+        deadline = time.perf_counter() + self.finalize_timeout
+        while t.is_alive():
+            if cancel and cancel():
+                self.kill()
+                raise RuntimeError("cancelled")
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                self.kill()
+                raise RuntimeError(
+                    f"Encoder {self.encoder} hung while finishing the MP4 (stdin close > "
+                    f"{self.finalize_timeout:.0f}s). Try another encoder or a shorter clip. {self._err()}"
+                )
+            t.join(timeout=min(0.5, left))
+            if progress:
+                progress(dict(stage="mux", done=0, total=1, detail="Finishing encode…"))
+        if close_err and self.proc.poll() is None:
+            log.warning("stdin close: %s", close_err[0])
+        # Wait for the process itself (mp4 remux / faststart).
+        while self.proc.poll() is None:
+            if cancel and cancel():
+                self.kill()
+                raise RuntimeError("cancelled")
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                self.kill()
+                raise RuntimeError(
+                    f"Encoder {self.encoder} timed out after {self.finalize_timeout:.0f}s while writing "
+                    f"the MP4. {self._err()}"
+                )
+            try:
+                self.proc.wait(timeout=min(0.5, left))
+            except subprocess.TimeoutExpired:
+                if progress:
+                    progress(dict(stage="mux", done=0, total=1, detail="Waiting for FFmpeg to finish…"))
+        rc = self.proc.returncode
         if rc != 0:
             raise RuntimeError(f"Encoder {self.encoder} failed ({rc}): {self._err()}")
-
-    def kill(self):
+        if progress:
+            progress(dict(stage="mux", done=1, total=2, detail="Video stream ready"))
         try:
-            self.proc.kill(); self.proc.wait(timeout=10)
+            self.err.close()
         except Exception:  # noqa: BLE001
             pass
 
+    def kill(self):
+        try:
+            if self.proc.stdin:
+                try:
+                    self.proc.stdin.close()
+                except OSError:
+                    pass
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+        self._closed = True
 
-def mux_audio(video_only, source, start, length, out_path, info: VideoInfo):
-    """Copy the trimmed original audio next to the new video. Returns a note for the UI."""
+
+def mux_timeout(length_s, floor=60.0):
+    try:
+        env = float(os.environ.get("FFS_MUX_TIMEOUT", "0") or 0)
+    except ValueError:
+        env = 0.0
+    if env > 0:
+        return max(30.0, env)
+    # Copying audio is usually seconds; allow plenty for long clips / busy disks, never infinite.
+    return max(floor, min(600.0, 45.0 + float(length_s) * 2.0))
+
+
+def mux_audio(video_only, source, start, length, out_path, info: VideoInfo, progress=None, cancel=None):
+    """Copy the trimmed original audio next to the new video. Returns a note for the UI.
+
+    Always finishes or raises within `mux_timeout` — never hangs on a stuck FFmpeg remux.
+    """
+    out_path = Path(out_path)
+    video_only = Path(video_only)
+    if not video_only.is_file() or video_only.stat().st_size < 64:
+        raise RuntimeError("Temporary video is missing or empty — encode did not produce a file.")
+    # Refuse to overwrite a destination that looks locked by another process (Windows Explorer preview, etc.).
+    if out_path.exists():
+        try:
+            with open(out_path, "a+b"):
+                pass
+        except OSError as e:
+            alt = out_path.with_name(out_path.stem + "_new" + out_path.suffix)
+            log.warning("output locked (%s) — writing to %s", e, alt.name)
+            out_path = alt
+            if progress:
+                progress(dict(stage="mux", done=1, total=2, detail=f"Output was locked; saving as {alt.name}"))
     if not info.has_audio:
-        shutil.move(video_only, out_path)
-        return "no sound in the source"
+        if progress:
+            progress(dict(stage="mux", done=1, total=1, detail="No sound in the source — saving video"))
+        shutil.move(str(video_only), str(out_path))
+        return "no sound in the source", out_path
     attempts = []
     if info.acodec in MP4_AUDIO_OK:
         attempts.append((["-c:a", "copy"], f"original sound copied ({info.acodec})"))
     attempts.append((["-c:a", "aac", "-b:a", "192k"], f"sound converted {info.acodec} → AAC"))
-    for aargs, note in attempts:
-        cmd = [ffmpeg(), "-v", "error", "-y", "-i", str(video_only), "-ss", f"{start:.6f}", "-t", f"{length:.6f}",
-               "-i", str(source), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *aargs, "-shortest",
-               "-movflags", "+faststart", str(out_path)]
-        if run(cmd, timeout=600).returncode == 0:
-            os.remove(video_only)
-            return note
-    shutil.move(video_only, out_path)
-    return "sound could not be copied (saved without sound)"
+    to = mux_timeout(length)
+    for i, (aargs, note) in enumerate(attempts):
+        if cancel and cancel():
+            raise RuntimeError("cancelled")
+        if progress:
+            progress(dict(stage="mux", done=1, total=2, detail=f"Muxing sound ({i + 1}/{len(attempts)})…"))
+        # -ss on the audio input after -i would re-decode; keep our previous filter placement but add -vn
+        # avoidance and a hard timeout. Prefer a quiet unique temp then rename so a half-written file
+        # is never left as the user's final path.
+        tmp_out = out_path.with_name(out_path.stem + f".mux{i}.tmp.mp4")
+        cmd = [ffmpeg(), "-v", "error", "-y",
+               "-i", str(video_only),
+               "-ss", f"{start:.6f}", "-t", f"{length:.6f}", "-i", str(source),
+               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *aargs, "-shortest",
+               "-movflags", "+faststart", str(tmp_out)]
+        try:
+            cp = run(cmd, timeout=to)
+        except RuntimeError as e:
+            log.warning("mux attempt %s timed out/failed: %s", i, e)
+            try:
+                tmp_out.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        if cp.returncode == 0 and tmp_out.is_file() and tmp_out.stat().st_size > 64:
+            try:
+                os.replace(tmp_out, out_path)
+            except OSError:
+                shutil.move(str(tmp_out), str(out_path))
+            try:
+                video_only.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if progress:
+                progress(dict(stage="mux", done=2, total=2, detail=note))
+            return note, out_path
+        log.warning("mux attempt %s rc=%s stderr=%s", i, cp.returncode,
+                    (cp.stderr or b"").decode("utf-8", "replace")[-200:])
+        try:
+            tmp_out.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if progress:
+        progress(dict(stage="mux", done=2, total=2, detail="Saving without sound"))
+    shutil.move(str(video_only), str(out_path))
+    return "sound could not be copied (saved without sound)", out_path
 
 
 def probe_output(path):

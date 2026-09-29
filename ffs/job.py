@@ -210,21 +210,26 @@ class Job:
         dopts = st.detect_opts()
         t0 = time.perf_counter()
         times, dets = [], []
+        # DirectML (and our Engine) only run inference on one thread. Keep a small pool for the
+        # CPU-only prep (resize/crop) so decode stays overlapped, then detect serially.
+        prep_n = max(1, min(n_det, 2))
         inflight = collections.deque()
 
-        def det_job(fr):
-            return detect.detect_frame(vcore.prep(fr, W, H, s), expected, dopts, engine=eng0)
+        def prep_job(fr):
+            return vcore.prep(fr, W, H, s)
 
-        with ThreadPoolExecutor(n_det, thread_name_prefix="detect") as pool:
+        with ThreadPoolExecutor(prep_n, thread_name_prefix="detect-prep") as pool:
             for k, t, fr in media.iter_frames(info.path, st.start, end, fps, cancel, st.sequential_decode):
                 times.append(t)
-                inflight.append(pool.submit(det_job, fr))
-                while len(inflight) > 2 * n_det:
-                    dets.append(inflight.popleft().result())
+                inflight.append(pool.submit(prep_job, fr))
+                while len(inflight) > prep_n + 1:
+                    frame = inflight.popleft().result()
+                    dets.append(detect.detect_frame(frame, expected, dopts, engine=eng0))
                     self._tick(progress, "detect", len(dets), total, t0)
                 if cancel and cancel(): raise Cancelled()
             while inflight:
-                dets.append(inflight.popleft().result())
+                frame = inflight.popleft().result()
+                dets.append(detect.detect_frame(frame, expected, dopts, engine=eng0))
                 self._tick(progress, "detect", len(dets), total, t0)
         if cancel and cancel(): raise Cancelled()
         if not dets:
@@ -357,24 +362,24 @@ class Job:
         if dump_dir: os.makedirs(dump_dir, exist_ok=True)
         t0 = time.perf_counter()
         last_thumb = [0.0]
-
-        def work(k, frame):
-            faces = [(an.smooth[ti][k].astype(np.float32), lat[a]) for ti, a in enumerate(assign)
-                     if a >= 0 and k in an.smooth[ti]]
-            # Landmark-driven swap every frame → mouth/expression follow the video person.
-            return core.process_frame(eng, frame, faces, st.enhance,
-                                      color_match=st.color_match, seamless=st.seamless)
-
+        # Inference is already serialised on Engine's ORT thread. Do not fan out many concurrent
+        # process_frame calls (they all queue on the same lock and only inflate memory). Keep a
+        # tiny overlap for CPU prep of the next frame while the current one is swapping.
         ok = False
         try:
-            inflight = collections.deque()
             written = 0
             prev_out = [None]
-
-            def drain_one():
-                nonlocal written
-                k, frame, fut = inflight.popleft()
-                out = fut.result()
+            end_t = an.times[-1] + 1e-3 if an.times else st.start + 1e-3
+            for k, t, fr in media.iter_frames(info.path, st.start, end_t, an.fps, cancel, st.sequential_decode):
+                if k >= n: break
+                if cancel and cancel(): raise Cancelled()
+                frame = vcore.prep(fr, an.W, an.H, an.s)
+                if frame is None or getattr(frame, "size", 0) == 0:
+                    raise RuntimeError(f"Could not decode frame {k} of the selected range.")
+                faces = [(an.smooth[ti][k].astype(np.float32), lat[a]) for ti, a in enumerate(assign)
+                         if a >= 0 and k in an.smooth[ti]]
+                out = core.process_frame(eng, frame, faces, st.enhance,
+                                         color_match=st.color_match, seamless=st.seamless)
                 if st.temporal_smooth and prev_out[0] is not None and prev_out[0].shape == out.shape:
                     a = float(np.clip(st.temporal_smooth, 0.0, 0.45))
                     out = np.clip((1.0 - a) * out.astype(np.float32) + a * prev_out[0].astype(np.float32),
@@ -390,24 +395,29 @@ class Job:
                 if now - last_thumb[0] > 0.5 or written == n:
                     last_thumb[0] = now; extra = {"thumb": out, "before": frame}
                 self._tick(progress, "swap", written, n, t0, extra)
-
-            with ThreadPoolExecutor(n_work, thread_name_prefix="swap") as pool:
-                for k, t, fr in media.iter_frames(info.path, st.start, an.times[-1] + 1e-3, an.fps, cancel, st.sequential_decode):
-                    if k >= n: break
-                    frame = vcore.prep(fr, an.W, an.H, an.s)
-                    inflight.append((k, frame, pool.submit(work, k, frame)))
-                    while len(inflight) > n_work + 1:
-                        drain_one()
-                    if cancel and cancel(): raise Cancelled()
-                while inflight:
-                    drain_one()
-            enc.close()
+            # Final / Finalize stage — always completes or raises a clear timeout error.
+            if progress:
+                progress(dict(stage="mux", done=0, total=2, detail="Finishing MP4 (encode)…"))
+            enc.close(progress=progress, cancel=cancel)
+            if written == 0:
+                raise RuntimeError("No frames were written — nothing to save.")
             if written != n:
-                raise RuntimeError(f"Decoded {written} frames, expected {n}")
-            if progress: progress(dict(stage="mux", done=n, total=n))
-            length = n / an.fps
-            note = media.mux_audio(tmp_video, info.path, st.start, length, out_path, info)
+                log.warning("wrote %s frames, expected %s — continuing with what we have", written, n)
+            length = written / an.fps if an.fps else 0.0
+            if progress:
+                progress(dict(stage="mux", done=1, total=2, detail="Saving MP4 and copying the sound…"))
+            note, out_path = media.mux_audio(tmp_video, info.path, st.start, length, out_path, info,
+                                             progress=progress, cancel=cancel)
+            n = written  # report the frames we actually produced
             ok = True
+        except Cancelled:
+            enc.kill()
+            raise
+        except RuntimeError as e:
+            enc.kill()
+            if str(e) == "cancelled" or (cancel and cancel()):
+                raise Cancelled() from e
+            raise
         except BaseException:
             enc.kill()
             raise

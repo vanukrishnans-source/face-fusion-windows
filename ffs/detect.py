@@ -5,12 +5,15 @@ plus bbox and confidence. No MediaPipe.
 """
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
 import numpy as np
+
+log = logging.getLogger("ffs")
 
 DEFAULT_MIN_CONF = 0.50
 DEFAULT_MIN_FACE_FRAC = 0.025
@@ -79,6 +82,40 @@ def _nms(boxes, scores, thr=0.4):
     return keep
 
 
+def as_bgr_uint8(img):
+    """Reject empty / weird frames before they reach ONNX (a bad shape can abort DirectML)."""
+    if img is None or not isinstance(img, np.ndarray) or img.size == 0:
+        raise ValueError("Empty frame — nothing to scan for faces.")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.ndim != 3 or img.shape[2] not in (3, 4):
+        raise ValueError(f"Unexpected image shape {getattr(img, 'shape', None)}.")
+    if img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    h, w = int(img.shape[0]), int(img.shape[1])
+    if h < 16 or w < 16:
+        raise ValueError(f"Image is too small to detect faces ({w}×{h}).")
+    if max(h, w) > 8192:
+        s = 8192.0 / max(h, w)
+        img = cv2.resize(img, (max(16, int(w * s)), max(16, int(h * s))), interpolation=cv2.INTER_AREA)
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(img)
+
+
+def _fit_square(img_bgr, size):
+    """Scale so the long side is <= size. Never produce a side of size+1 (round-up) or 0."""
+    h0, w0 = img_bgr.shape[:2]
+    s = min(1.0, float(size) / float(max(h0, w0)))
+    tw = max(1, min(int(size), int(round(w0 * s))))
+    th = max(1, min(int(size), int(round(h0 * s))))
+    if (tw, th) != (w0, h0):
+        temp = cv2.resize(img_bgr, (tw, th), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+    else:
+        temp = img_bgr
+    return temp, w0 / float(tw), h0 / float(th)
+
+
 def _letterbox(img, size):
     """Resize keeping aspect, pad to size×size (FaceFusion prepare_detect_frame style)."""
     h, w = img.shape[:2]
@@ -106,31 +143,45 @@ class FaceDetector:
 
     def detect(self, img_bgr, opts: DetectOpts | None = None) -> list[FaceHit]:
         opts = opts or DetectOpts()
+        img_bgr = as_bgr_uint8(img_bgr)
         self._ensure()
-        h0, w0 = img_bgr.shape[:2]
-        size = opts.detector_size or self.size
-        if self.model_name.startswith("yolo"):
-            return self._detect_yolo(img_bgr, opts, size)
-        return self._detect_retina(img_bgr, opts, size)
+        size = int(opts.detector_size or self.size)
+        if size < 32 or size > 2048:
+            size = DEFAULT_DETECTOR_SIZE
+        try:
+            if self.model_name.startswith("yolo"):
+                return self._detect_yolo(img_bgr, opts, size)
+            return self._detect_retina(img_bgr, opts, size)
+        except ValueError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("face detector failed")
+            raise RuntimeError(
+                f"Face detection failed ({type(e).__name__}: {e}). "
+                "If this keeps happening, set Processor to CPU in Options. "
+                "A log was written to %LOCALAPPDATA%\\FaceFusionStudio\\crash.log."
+            ) from e
 
     def _detect_yolo(self, img_bgr, opts, size):
         # FaceFusion detect_with_yolo_face
         h0, w0 = img_bgr.shape[:2]
-        # restrict then pad
-        s = min(1.0, size / max(h0, w0))
-        if s < 1:
-            temp = cv2.resize(img_bgr, (int(round(w0 * s)), int(round(h0 * s))), interpolation=cv2.INTER_AREA)
-        else:
-            temp = img_bgr
-            s = 1.0
+        temp, ratio_w, ratio_h = _fit_square(img_bgr, size)
         th, tw = temp.shape[:2]
-        ratio_h = h0 / th
-        ratio_w = w0 / tw
         canvas = np.zeros((size, size, 3), np.float32)
         canvas[:th, :tw] = temp.astype(np.float32)
         inp = (canvas.transpose(2, 0, 1)[None] / 255.0).astype(np.float32)
         out = self.engine.run(self.model_name, {"input": inp})[0]
-        det = np.squeeze(out).T  # (N, 4+1+15) = box xywh, score, 5*(x,y,vis)
+        det = np.squeeze(np.asarray(out))
+        if det.ndim != 2:
+            log.warning("unexpected yolo output shape %s", getattr(out, "shape", None))
+            return []
+        # Channel axis is the small one (20 = box4 + score + 15 landmark values), anchors are the long one.
+        if det.shape[0] <= 64 and det.shape[1] > det.shape[0]:
+            det = det.T
+        elif det.shape[1] <= 64 and det.shape[0] > det.shape[1]:
+            pass
+        else:
+            det = det.T
         if det.ndim != 2 or det.shape[1] < 5:
             return []
         boxes_raw = det[:, :4]
@@ -148,12 +199,17 @@ class FaceDetector:
             y1 = (cy + bh / 2) * ratio_h
             boxes.append([x0, y0, x1, y1])
             sc.append(float(scores[i]))
-            if lms_raw is not None:
+            if lms_raw is not None and lms_raw[i].size % 3 == 0:
                 lm = lms_raw[i].reshape(-1, 3)[:, :2].copy()
-                lm[:, 0] *= ratio_w
-                lm[:, 1] *= ratio_h
-                lms.append(lm)
+                if lm.shape[0] < 5 or not np.isfinite(lm).all():
+                    lm = None
+                else:
+                    lm[:, 0] *= ratio_w
+                    lm[:, 1] *= ratio_h
+                    lms.append(lm.astype(np.float32))
             else:
+                lm = None
+            if lms_raw is None or lm is None:
                 # synthesize 5 pts from bbox
                 lms.append(np.array([
                     [x0 + 0.3 * (x1 - x0), y0 + 0.35 * (y1 - y0)],
@@ -168,9 +224,11 @@ class FaceDetector:
         for i in idx[:opts.max_faces]:
             b = boxes[i]
             fw, fh = b[2] - b[0], b[3] - b[1]
+            if not np.isfinite(b).all() or not np.isfinite(lms[i]).all():
+                continue
             if min(fw, fh) / short < opts.min_face_frac:
                 continue
-            hits.append(FaceHit(kps=lms[i], confidence=sc[i], bbox=tuple(b)))
+            hits.append(FaceHit(kps=lms[i], confidence=sc[i], bbox=(float(b[0]), float(b[1]), float(b[2]), float(b[3]))))
         # left-to-right
         hits.sort(key=lambda h: (h.bbox[0] + h.bbox[2]) / 2)
         return hits
@@ -179,14 +237,8 @@ class FaceDetector:
         # Simplified RetinaFace 10G path (FaceFusion feature strides 8/16/32)
         from . import models as M
         h0, w0 = img_bgr.shape[:2]
-        s = min(1.0, size / max(h0, w0))
-        if s < 1:
-            temp = cv2.resize(img_bgr, (int(round(w0 * s)), int(round(h0 * s))), interpolation=cv2.INTER_AREA)
-        else:
-            temp = img_bgr
+        temp, ratio_w, ratio_h = _fit_square(img_bgr, size)
         th, tw = temp.shape[:2]
-        ratio_h = h0 / max(th, 1)
-        ratio_w = w0 / max(tw, 1)
         canvas = np.zeros((size, size, 3), np.float32)
         canvas[:th, :tw] = temp.astype(np.float32)
         inp = ((canvas.transpose(2, 0, 1)[None] - 127.5) / 128.0).astype(np.float32)
@@ -235,9 +287,11 @@ class FaceDetector:
         hits = []
         for i in idx[:opts.max_faces]:
             b = boxes[i]
+            if not np.isfinite(b).all() or not np.isfinite(lms[i]).all():
+                continue
             if min(b[2] - b[0], b[3] - b[1]) / short < opts.min_face_frac:
                 continue
-            hits.append(FaceHit(kps=lms[i], confidence=sc[i], bbox=tuple(b)))
+            hits.append(FaceHit(kps=lms[i], confidence=sc[i], bbox=tuple(float(x) for x in b)))
         hits.sort(key=lambda h: (h.bbox[0] + h.bbox[2]) / 2)
         return hits
 

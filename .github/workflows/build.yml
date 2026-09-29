@@ -76,7 +76,7 @@ jobs:
           Copy-Item ffmpeg/* dist/FaceFusionStudio/ffmpeg/ -Force
           "{0:N1} MB" -f ((Get-ChildItem dist/FaceFusionStudio -Recurse | Measure-Object Length -Sum).Sum / 1MB)
 
-      - name: Selftest - packaged FaceFusionStudio_cli.exe (photo + video, CPU, DirectML smoke)
+      - name: Selftest - packaged FaceFusionStudio_cli.exe (photo + video through Final/mux, CPU, DirectML smoke)
         shell: pwsh
         run: |
           $out = "$PWD\selftest-out\cli"
@@ -185,7 +185,7 @@ jobs:
           $r = Get-Content selftest-out\cli\selftest_report.json -Raw | ConvertFrom-Json
           $dml = if ($r.directml) { ($r.directml | ConvertTo-Json -Compress -Depth 6) } else { "n/a" }
           $lines = @(
-            "Face Fusion Studio **1.0** — portable Windows 10/11 x64 for the ASUS ROG Ally X (Radeon 780M, DirectML). Powered by FaceFusion-compatible ONNX models (YOLO Face + ArcFace + inswapper_128 fp16 + GPEN).",
+            "Face Fusion Studio **$ver** — portable Windows 10/11 x64 for the ASUS ROG Ally X (Radeon 780M, DirectML). Powered by FaceFusion-compatible ONNX models (YOLO Face + ArcFace + inswapper_128 fp16 + GPEN).",
             "",
             "| Asset | Size | SHA-256 |",
             "|---|---|---|",
@@ -195,6 +195,11 @@ jobs:
             "1. Unzip, open the FaceFusionStudio folder, run **FaceFusionStudio.exe**.",
             "2. **SmartScreen** (unsigned): click **More info** then **Run anyway**.",
             "3. Download AI models when asked (~465 MB required). InsightFace models are personal / non-commercial only.",
+            "",
+            "### Fixes in this release",
+            "- Finding faces no longer closes the app (DirectML/ONNX now runs on one dedicated MTA thread).",
+            "- Final / Finalize (encode + audio) always completes or times out with a clear error; progress updates; Cancel works.",
+            "- Crash log: `%LOCALAPPDATA%\\FaceFusionStudio\\crash.log`",
             "",
             "### Modes",
             "- Photo swap → Pictures\\FaceFusion",

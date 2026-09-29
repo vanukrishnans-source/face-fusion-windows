@@ -21,7 +21,9 @@ log = logging.getLogger("ffs")
 
 
 def _setup_logging(verbose=True):
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share")) / "FaceFusionStudio"
+    from . import crashlog
+    crashlog.install()
+    base = crashlog.log_dir()
     base.mkdir(parents=True, exist_ok=True)
     handlers = [logging.FileHandler(base / "facefusionstudio.log", encoding="utf-8")]
     if verbose and sys.stdout is not None:
@@ -43,15 +45,20 @@ def versions():
                 detector="yoloface_8n")
 
 
-def _progress_printer(prefix=""):
+def _progress_printer(prefix="", stages=None):
     last = [0.0]
+    seen = stages if stages is not None else []
     def cb(d):
         now = time.time()
-        if d.get("stage") in ("done", "mux") or now - last[0] > 2:
+        st = d.get("stage")
+        if st and (not seen or seen[-1] != st):
+            seen.append(st)
+        if st in ("done", "mux") or now - last[0] > 2:
             last[0] = now
             eta = d.get("eta")
-            log.info("%s%s %s/%s %.2f/s eta %s", prefix, d.get("stage"), d.get("done"), d.get("total"),
-                     d.get("rate") or 0, f"{eta:.0f}s" if eta else "-")
+            detail = d.get("detail") or ""
+            log.info("%s%s %s/%s %.2f/s eta %s %s", prefix, st, d.get("done"), d.get("total"),
+                     d.get("rate") or 0, f"{eta:.0f}s" if eta else "-", detail)
     return cb
 
 
@@ -139,15 +146,25 @@ def selftest(args):
             import cv2
             sheet = np.hstack([pres["before"], np.full((pres["before"].shape[0], 8, 3), 32, np.uint8), pres["after"]])
             cv2.imwrite(str(out_dir / "before_after_photo.jpg"), sheet)
-        # ---- video selftest ----
+        # ---- video selftest (must reach Final/mux and exit cleanly) ----
         st = Settings(start=args.start, length=args.length, fps=args.fps, max_short=args.max_short, enhance=enh,
                       device=args.device, out_dir=str(out_dir),
                       min_confidence=args.min_confidence, min_face_frac=args.min_face_frac,
                       same_gender=args.same_gender, color_match=args.color_match,
                       temporal_smooth=args.temporal_smooth, seamless=args.seamless, emb_track=args.emb_track)
         out = out_dir / "selftest_output.mp4"
-        res = job.run(info, photo, st, out_path=out, progress=_progress_printer())
+        stages = []
+        t_job = time.perf_counter()
+        res = job.run(info, photo, st, out_path=out, progress=_progress_printer(stages=stages))
         report["result"] = res
+        report["stages"] = stages
+        report["job_s"] = round(time.perf_counter() - t_job, 2)
+        c = report["checks"]
+        c["reached_detect"] = "detect" in stages
+        c["reached_swap"] = "swap" in stages
+        c["reached_final_mux"] = "mux" in stages
+        c["reached_done"] = "done" in stages
+        c["final_exited_clean"] = out.is_file() and out.stat().st_size > 1000 and "done" in stages
         meta = media.probe_output(out)
         streams = meta.get("streams", [])
         v = [s for s in streams if s["codec_type"] == "video"]; a = [s for s in streams if s["codec_type"] == "audio"]
@@ -280,9 +297,9 @@ def main(argv=None):
     except BaseException:  # noqa: BLE001
         traceback.print_exc()
         try:
-            crash = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "FaceFusionStudio" / "crash.log"
-            crash.parent.mkdir(parents=True, exist_ok=True)
-            crash.write_text(traceback.format_exc(), encoding="utf-8")
+            from . import crashlog
+            crashlog.install()
+            crashlog.record_current(where="main")
         except Exception:  # noqa: BLE001
             pass
         code = 1

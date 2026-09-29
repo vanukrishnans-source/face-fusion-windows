@@ -5,11 +5,14 @@ Preview (before / after) · Options · Progress · Done.  All heavy work runs in
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
 import traceback
 from pathlib import Path
+
+log = logging.getLogger("ffs")
 
 import cv2
 import numpy as np
@@ -33,9 +36,13 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 def pix(bgr, w, h):
     """BGR ndarray -> QPixmap fitted into w x h (logical px; rendered at device pixel ratio)."""
+    if bgr is None or getattr(bgr, "size", 0) == 0:
+        return QPixmap()
     dpr = QApplication.instance().devicePixelRatio() if QApplication.instance() else 1.0
     W, H = int(w * dpr), int(h * dpr)
     ih, iw = bgr.shape[:2]
+    if ih < 1 or iw < 1:
+        return QPixmap()
     s = min(W / iw, H / ih)
     img = cv2.resize(bgr, (max(1, int(iw * s)), max(1, int(ih * s))), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -80,7 +87,14 @@ class Worker(QThread):
             if self.cancelled or str(e) == "cancelled":
                 self.failed.emit("cancelled", "")
             else:
-                self.failed.emit(str(e), traceback.format_exc())
+                tb = traceback.format_exc()
+                log.error("worker failed: %s\n%s", e, tb)
+                try:
+                    from .. import crashlog
+                    crashlog.record_current(where="worker")
+                except Exception:  # noqa: BLE001
+                    pass
+                self.failed.emit(str(e) or type(e).__name__, tb)
 
 
 def button(text, kind=None, min_w=0):
@@ -439,16 +453,39 @@ class MainWindow(QMainWindow):
 
     def _refresh_video_faces(self):
         if not self.info: return
+        if self.worker and self.worker.isRunning():
+            # Don't start a second heavy job while Swap / Preview is running.
+            fr = media.read_frame_at(self.info.path, self.s_start.value() / 10)
+            if fr is not None:
+                self.thumb = fr; self._redraw()
+            return
         fr = media.read_frame_at(self.info.path, self.s_start.value() / 10)
         if fr is None: return
         self.thumb = fr
-        try:
-            eng = self.job.get_engine(); eng.prepare(None)
-            detect.set_default_engine(eng)
-            self.vfaces = sorted(detect.detect_frame(fr, 2, self.settings().detect_opts(), engine=eng), key=lambda f: f[:, 0].mean())
-        except Exception:  # noqa: BLE001
-            self.vfaces = []
-        self._redraw()
+        st = self.settings()
+        path = self.info.path
+        t0 = self.s_start.value() / 10
+
+        def work(cancelled, emit):
+            eng = self.job.get_engine(); eng.prepare(None, detector=st.detector)
+            detect.set_default_engine(eng, "yoloface_8n" if st.detector != "retina" else "retinaface_10g")
+            frame = media.read_frame_at(path, t0) or fr
+            faces = detect.detect_frame(frame, 2, st.detect_opts(), engine=eng)
+            faces = sorted(faces, key=lambda f: f[:, 0].mean())
+            return frame, faces
+
+        self.worker = Worker(work, self)
+
+        def done(res):
+            frame, faces = res
+            self.thumb = frame; self.vfaces = faces; self._redraw()
+
+        def failed(msg, tb):
+            log.warning("video face refresh failed: %s", msg)
+            self.vfaces = []; self._redraw()
+
+        self.worker.done.connect(done); self.worker.failed.connect(failed)
+        self.worker.start()
 
     def set_photo(self, p):
         try:
@@ -765,7 +802,12 @@ class MainWindow(QMainWindow):
             eta = d.get("eta"); rate = d.get("rate") or 0
             self.prog_text.setText(f"Frame {done} of {total} · {rate:.1f} frames/s" + (f" · about {media.fmt_time(eta)[:-2]} left" if eta else ""))
         elif stage == "mux":
-            self.prog_bar.setValue(990); self.prog_text.setText("Saving MP4 and copying the sound…")
+            # Final / Finalize — keep the bar moving and show the real sub-step.
+            frac = done / total if total else 0.0
+            self.prog_bar.setValue(980 + int(20 * min(1.0, frac)))
+            detail = d.get("detail") or "Saving MP4 and copying the sound…"
+            self.prog_text.setText(detail)
+            self.prog_title.setText("Final — saving your video…")
         if "thumb" in d:
             self.prog_imgs[0].setPixmap(pix(d["before"], 600, 330)); self.prog_imgs[1].setPixmap(pix(d["thumb"], 600, 330))
         if self.job.engine: self.prog_dev.setText(f"{self.job.engine.info.label()} · elapsed {media.fmt_time(time.time() - self.run_t0)[:-2]}"); self.set_chip()
@@ -777,10 +819,19 @@ class MainWindow(QMainWindow):
 
     def _failed(self, msg, tb):
         self.btn_preview.setText("Preview"); self.btn_preview.setEnabled(True)
+        self.btn_cancel.setEnabled(True)
         if msg == "cancelled":
             self.go(PAGE_MAIN); return
         box = QMessageBox(self); box.setIcon(QMessageBox.Icon.Warning); box.setWindowTitle("Something went wrong")
-        box.setText(msg); box.setDetailedText(tb); box.exec()
+        hint = ""
+        try:
+            from .. import crashlog
+            hint = f"\n\nA log was saved to:\n{crashlog.crash_path()}"
+        except Exception:  # noqa: BLE001
+            pass
+        box.setText((msg or "Unknown error") + hint)
+        box.setDetailedText(tb or "")
+        box.exec()
         self.go(PAGE_MAIN if self.store.all_installed() else PAGE_SETUP)
 
     # ------------------------------------------------------------------ done
@@ -882,6 +933,8 @@ def make_app(argv=None):
 
 
 def run_gui(args=None) -> int:
+    from .. import crashlog
+    crashlog.install()
     if os.name == "nt":
         try:
             import ctypes
@@ -892,6 +945,19 @@ def run_gui(args=None) -> int:
         from .screens import take_screenshots
         return take_screenshots(args)
     app = make_app()
+    def _qt_msg(mode, context, message):
+        # Qt fatals used to kill silently; keep a breadcrumb in the crash log.
+        try:
+            from PySide6.QtCore import QtMsgType
+            if mode in (QtMsgType.QtFatalMsg, QtMsgType.QtCriticalMsg):
+                crashlog.record(RuntimeError, RuntimeError(f"Qt {mode}: {message}"), None, where="qt")
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from PySide6.QtCore import qInstallMessageHandler
+        qInstallMessageHandler(_qt_msg)
+    except Exception:  # noqa: BLE001
+        pass
     store = ModelStore(Path(args.models) if args is not None and args.models else None)
     win = MainWindow(store, getattr(args, "device", "auto") if args is not None else "auto")
     from .gamepad import Gamepad

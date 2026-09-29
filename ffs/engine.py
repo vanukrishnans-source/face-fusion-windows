@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import mmap
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -119,6 +120,13 @@ def gpu_adapter_name() -> str:
 
 
 class Engine:
+    """ONNX sessions are created and run on one dedicated thread.
+
+    DirectML is COM-based and aborts the process (the window just vanishes) when `Session.run` happens
+    on a different thread from the one that created the session, or concurrently from the detect/swap
+    pools. Qt's UI thread is STA; DirectML wants MTA. All inference is hopped onto `_loop`.
+    """
+
     def __init__(self, store: M.ModelStore, device: str = "auto", threads: int = 0):
         import onnxruntime as ort
         self.ort = ort
@@ -128,6 +136,13 @@ class Engine:
         self.lock = threading.Lock()
         self.sessions: dict = {}
         self._emap = None
+        self._stuck = False
+        self._stuck_why = ""
+        try:
+            self.infer_timeout = float(os.environ.get("FFS_INFER_TIMEOUT", "120") or 120)
+        except ValueError:
+            self.infer_timeout = 120.0
+        self.infer_timeout = max(15.0, self.infer_timeout)
         self.info = DeviceInfo(requested=device)
         avail = ort.get_available_providers()
         self.dml_available = "DmlExecutionProvider" in avail
@@ -136,6 +151,55 @@ class Engine:
         self.info.active = "DirectML" if (device in ("auto", "dml") and self.dml_available) else "CPU"
         if self.info.active == "DirectML":
             self.info.adapter = gpu_adapter_name()
+        self._q: queue.Queue = queue.Queue()
+        self._thr = threading.Thread(target=self._loop, name="ffs-ort", daemon=True)
+        self._thr.start()
+
+    def _loop(self):
+        if os.name == "nt":
+            try:
+                import ctypes
+                # COINIT_MULTITHREADED — DirectML must not run on Qt's STA UI thread.
+                ctypes.windll.ole32.CoInitializeEx(None, 0x0)
+            except Exception as e:  # noqa: BLE001
+                log.warning("CoInitializeEx MTA failed: %s", e)
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            fn, box, ev = item
+            try:
+                box["result"] = fn()
+            except BaseException as e:  # noqa: BLE001 — handed back to the caller
+                box["error"] = e
+            finally:
+                ev.set()
+
+    def _stuck_message(self):
+        why = self._stuck_why or "the GPU did not respond"
+        return (f"Face processing stalled ({why}). This job was stopped so the app would not sit forever. "
+                "Restart Face Fusion Studio and, in Options, set Processor to CPU if it keeps happening. "
+                "Details: %LOCALAPPDATA%\\FaceFusionStudio\\crash.log")
+
+    def _call(self, fn, timeout):
+        if self._stuck:
+            raise RuntimeError(self._stuck_message())
+        if threading.current_thread() is self._thr:
+            return fn()
+        ev = threading.Event()
+        box = {}
+        self._q.put((fn, box, ev))
+        if not ev.wait(timeout):
+            self._stuck = True
+            self._stuck_why = f"no result in {timeout:.0f}s on {self.info.active}"
+            log.error("inference timeout: %s", self._stuck_why)
+            raise RuntimeError(self._stuck_message())
+        if "error" in box:
+            err = box["error"]
+            if isinstance(err, BaseException):
+                raise err
+            raise RuntimeError(str(err))
+        return box.get("result")
 
     def _options(self, dml: bool):
         so = self.ort.SessionOptions()
@@ -191,15 +255,17 @@ class Engine:
         except Exception:  # noqa: BLE001 — warmup best-effort (input name may differ)
             pass
 
-    def session(self, name):
+    def _session_locked(self, name):
+        """Create/fetch a session. Only call on the ORT thread."""
         s = self.sessions.get(name)
         if s is None:
-            with self.lock:
-                s = self.sessions.get(name)
-                if s is None:
-                    s = self._open(name)
-                    self.sessions[name] = s
+            s = self._open(name)
+            self.sessions[name] = s
         return s
+
+    def session(self, name):
+        # Model load + DirectML graph compile can take a couple of minutes the first time.
+        return self._call(lambda: self._session_locked(name), timeout=max(300.0, self.infer_timeout))
 
     def prepare(self, enhance_mode=None, detector="yolo"):
         det = "yoloface_8n" if detector != "retina" else "retinaface_10g"
@@ -211,9 +277,26 @@ class Engine:
         return self.info
 
     def run(self, name, feeds):
-        s = self.session(name)
-        with self.lock:
-            return s.run(None, feeds)
+        safe = {}
+        for k, v in feeds.items():
+            a = np.asarray(v)
+            if a.size == 0 or any(int(d) <= 0 for d in a.shape):
+                raise RuntimeError(f"Model {name} got an empty input '{k}' shape {tuple(a.shape)}.")
+            if a.dtype != np.float32:
+                a = a.astype(np.float32, copy=False)
+            safe[k] = np.ascontiguousarray(a)
+
+        def _run():
+            try:
+                s = self._session_locked(name)
+                return s.run(None, safe)
+            except RuntimeError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.exception("onnx run %s failed", name)
+                raise RuntimeError(f"{name} failed on {self.info.active}: {type(e).__name__}: {e}") from e
+
+        return self._call(_run, timeout=self.infer_timeout)
 
     def emap(self):
         if self._emap is None:
@@ -221,7 +304,16 @@ class Engine:
         return self._emap
 
     def close(self):
-        self.sessions.clear()
+        def _close():
+            self.sessions.clear()
+        try:
+            if not self._stuck:
+                self._call(_close, timeout=30)
+            else:
+                self.sessions.clear()
+        except Exception as e:  # noqa: BLE001
+            log.warning("engine close: %s", e)
+            self.sessions.clear()
 
     def benchmark(self, modes=("off", "gpen256", "gpen512"), reps=3):
         res = {}
@@ -231,13 +323,12 @@ class Engine:
                 continue
             if not self.store.is_installed(FILES[name]):
                 continue
-            s = self.session(name)
+            self.session(name)
             feeds = {k: np.random.default_rng(0).random(v, dtype=np.float32) for k, v in WARMUP[name].items()}
             ts = []
             for _ in range(reps + 1):
                 t = time.perf_counter()
-                with self.lock:
-                    s.run(None, feeds)
+                self.run(name, feeds)
                 ts.append(time.perf_counter() - t)
             res[key] = float(np.median(ts[1:]))
         return res
